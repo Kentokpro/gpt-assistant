@@ -1,0 +1,38 @@
+# Секреты
+.env
+.env.*
+.env.docker
+backend/.env
+backend/.env.backend
+
+# Данные и дампы
+*.log
+*.bak
+*.sql
+*.gz
+*.dump
+*.tar
+*.zip
+*.pkl
+*.json
+db_data/
+redis_data/
+chroma_data/
+
+# Виртуальные окружения
+venv/
+
+# Python кэш
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE и редакторы
+.idea/
+.vscode/
+
+# Медиа/временные файлы
+media/
+uploads/
+tmp/
+*.tmp
