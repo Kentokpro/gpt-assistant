@@ -1,5 +1,5 @@
 import logging
-from fastapi import FastAPI, Request, Depends, HTTPException, status
+from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -9,12 +9,12 @@ from auth import (
     fastapi_users, auth_backend, current_active_user, require_active_subscription
 )
 from config import (
-    DEBUG, LOG_LEVEL, CORS_ORIGINS, ADMIN_EMAIL, GA_MEASUREMENT_ID, METRIKA_ID, SUPPORT_EMAIL
+    DEBUG, LOG_LEVEL, ADMIN_EMAIL, GA_MEASUREMENT_ID, METRIKA_ID, SUPPORT_EMAIL
 )
 from email_utils import send_email
 from openai_utils import ask_openai
-from models import Message, Session   # <-- только ORM классы!
-from schemas import UserRead, UserCreate  # <-- Pydantic схемы импортируем из schemas.py
+from models import Message, Session
+from schemas import UserRead, UserCreate
 from database import SessionLocal
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,14 +29,19 @@ app = FastAPI(
 )
 
 # --- CORS ---
-if CORS_ORIGINS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=CORS_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+ALLOWED_ORIGINS = [
+    "https://leadinc.ru",
+    "https://gpt.leadinc.ru",
+    "http://localhost:3000",      # Для разработки
+    "http://127.0.0.1:3000"
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # --- Статические файлы ---
 MEDIA_DIR = Path(__file__).parent / "media"
@@ -51,8 +56,8 @@ app.include_router(
 )
 app.include_router(
     fastapi_users.get_register_router(
-        user_schema=UserRead,           # <-- схема для response (чтение)
-        user_create_schema=UserCreate   # <-- схема для регистрации (создание)
+        user_schema=UserRead,
+        user_create_schema=UserCreate
     ),
     prefix="/auth",
     tags=["auth"],
