@@ -1,17 +1,16 @@
 from fastapi import Depends, HTTPException, status
 from fastapi_users import FastAPIUsers
 from fastapi_users.authentication import JWTStrategy, CookieTransport, AuthenticationBackend
-from fastapi_users.db import SQLAlchemyUserDatabase
-from sqlalchemy.ext.asyncio import AsyncSession
-from jose import jwt, JWTError
-from config import SECRET_KEY, SESSION_COOKIE_NAME, SECURE_COOKIES
-from database import SessionLocal
 from models import User, Subscription
 import uuid
+from config import SECRET_KEY, SESSION_COOKIE_NAME, SECURE_COOKIES
+from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import EmailStr
 from typing import Optional
 from fastapi_users.schemas import BaseUser, BaseUserCreate, BaseUserUpdate
 from sqlalchemy.future import select
+from database import SessionLocal
+from user_manager import get_user_manager  # Импортируем новый менеджер
 
 # --- Pydantic схемы для пользователя ---
 class UserRead(BaseUser):
@@ -25,11 +24,6 @@ class UserCreate(BaseUserCreate):
 class UserUpdate(BaseUserUpdate):
     display_name: Optional[str] = None
     email: Optional[EmailStr] = None
-
-# --- FastAPI Users и JWT ---
-async def get_user_db():
-    async with SessionLocal() as session:
-        yield SQLAlchemyUserDatabase(session, User)
 
 def get_jwt_strategy():
     return JWTStrategy(secret=SECRET_KEY, lifetime_seconds=60 * 60 * 24 * 7, token_audience="fastapi-users")
@@ -48,13 +42,15 @@ auth_backend = AuthenticationBackend(
     get_strategy=get_jwt_strategy,
 )
 
-fastapi_users = FastAPIUsers[User, uuid.UUID](get_user_db, [auth_backend])
+# ВАЖНО! Используем get_user_manager вместо get_user_db
+fastapi_users = FastAPIUsers[User, uuid.UUID](get_user_manager, [auth_backend])
 
 current_active_user = fastapi_users.current_user(active=True)
 current_superuser = fastapi_users.current_user(superuser=True)
 
 # --- Проверка JWT вручную (опционально) ---
 def decode_jwt_token(token: str):
+    from jose import jwt, JWTError
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
         return payload
