@@ -1,5 +1,5 @@
 import openai
-from config import OPENAI_API_KEY
+from backend.config import OPENAI_API_KEY
 import logging
 import aiofiles
 import tempfile

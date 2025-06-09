@@ -1,0 +1,11 @@
+fastapi==0.110.0
+uvicorn==0.29.0
+pydantic==1.10.22
+fastapi-users==14.0.1
+fastapi-users-db-sqlalchemy==7.0.0
+python-dotenv==1.0.1
+sqlalchemy==2.0.30
+asyncpg==0.29.0
+python-jose==3.3.0
+aiofiles==23.2.1
+openai==1.30.1

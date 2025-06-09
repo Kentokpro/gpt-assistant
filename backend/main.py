@@ -4,23 +4,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
+from typing import Any
+print("DEBUG: Any imported:", Any)
+import os
+print("DEBUG: MAIN.PY location:", __file__)
+print("DEBUG: Working directory:", os.getcwd())
 
-from auth import (
-    fastapi_users, auth_backend, current_active_user, require_active_subscription
+from backend.auth import (
+    fastapi_users, auth_backend, require_active_subscription
 )
-from config import (
+from backend.config import (
     DEBUG, LOG_LEVEL, ADMIN_EMAIL, GA_MEASUREMENT_ID, METRIKA_ID, SUPPORT_EMAIL
 )
-from email_utils import send_email
-from openai_utils import ask_openai
-from models import Message, Session
-from schemas import UserRead, UserCreate
-from database import SessionLocal
+from backend.email_utils import send_email
+from backend.openai_utils import ask_openai
+from backend.models import Message, Session
+from backend.schemas import UserRead, UserCreate
+from backend.database import SessionLocal
 from sqlalchemy.ext.asyncio import AsyncSession
-
-# --- Логирование ---
-logging.basicConfig(level=LOG_LEVEL)
-logger = logging.getLogger("leadinc-backend")
 
 app = FastAPI(
     title="Leadinc AI Assistant",
@@ -28,11 +29,15 @@ app = FastAPI(
     debug=DEBUG
 )
 
+# --- Логирование ---
+logging.basicConfig(level=LOG_LEVEL)
+logger = logging.getLogger("leadinc-backend")
+
 # --- CORS ---
 ALLOWED_ORIGINS = [
     "https://leadinc.ru",
     "https://gpt.leadinc.ru",
-    "http://localhost:3000",      # Для разработки
+    "http://localhost:3000",
     "http://127.0.0.1:3000"
 ]
 app.add_middleware(
@@ -68,12 +73,11 @@ app.include_router(
 async def chat(
     request: Request,
     user=Depends(require_active_subscription),
-    session: AsyncSession = Depends(SessionLocal),
+    session: AsyncSession = Depends(lambda: SessionLocal()),
 ):
     data = await request.json()
     content = data.get("content")
     msg_type = data.get("type", "text")
-    meta = {}
 
     if msg_type != "text":
         raise HTTPException(status_code=400, detail="Мультимодальность пока не реализована.")
@@ -112,18 +116,14 @@ async def chat(
     except Exception as e:
         logger.error(f"DB error: {str(e)}")
 
-    return JSONResponse(
-        {
-            "reply": reply,
-            "meta": usage,
-        }
-    )
+    return JSONResponse({"reply": reply, "meta": usage})
 
-# --- Endpoint истории сообщений пользователя ---
+
+# --- История сообщений пользователя ---
 @app.get("/history", tags=["ai"])
 async def history(
     user=Depends(require_active_subscription),
-    session: AsyncSession = Depends(SessionLocal),
+    session: AsyncSession = Depends(lambda: SessionLocal()),
     limit: int = 50,
 ):
     result = await session.execute(
@@ -135,12 +135,14 @@ async def history(
     messages = [dict(row) for row in result.fetchall()]
     return messages
 
-# --- Healthcheck endpoint ---
+
+# --- Healthcheck ---
 @app.get("/health", tags=["health"])
 async def health():
     return {"status": "ok"}
 
-# --- Email рассылка (пример endpoint) ---
+
+# --- Email-поддержка ---
 @app.post("/support", tags=["support"])
 async def support_request(
     request: Request,
@@ -157,7 +159,8 @@ async def support_request(
     )
     return {"status": "sent"}
 
-# --- Google Analytics и Яндекс.Метрика (сквозная мета) ---
+
+# --- Сквозная аналитика ---
 @app.middleware("http")
 async def add_analytics_headers(request: Request, call_next):
     response = await call_next(request)
