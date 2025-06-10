@@ -1,12 +1,13 @@
 import logging
-from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi import FastAPI, Request, Depends, HTTPException, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from typing import Any
-print("DEBUG: Any imported:", Any)
 import os
+
+print("DEBUG: Any imported:", Any)
 print("DEBUG: MAIN.PY location:", __file__)
 print("DEBUG: Working directory:", os.getcwd())
 
@@ -19,21 +20,22 @@ from backend.config import (
 from backend.email_utils import send_email
 from backend.openai_utils import ask_openai
 from backend.models import Message, Session
-from backend.schemas import UserRead, UserCreate
+from backend.schemas import UserRead, UserCreate, ChatRequest, SupportRequest
 from backend.database import SessionLocal
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# ------------------ FastAPI app ------------------
 app = FastAPI(
     title="Leadinc AI Assistant",
     description="AI SaaS Assistant (B2B)",
     debug=DEBUG
 )
 
-# --- Логирование ---
+# ------------------ Логирование ------------------
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger("leadinc-backend")
 
-# --- CORS ---
+# ------------------ CORS ------------------------
 ALLOWED_ORIGINS = [
     "https://leadinc.ru",
     "https://gpt.leadinc.ru",
@@ -48,12 +50,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Статические файлы ---
+# ------------------ Статические файлы ------------
 MEDIA_DIR = Path(__file__).parent / "media"
 MEDIA_DIR.mkdir(exist_ok=True)
 app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
-# --- Auth routers ---
+# ------------------ Auth routers -----------------
 app.include_router(
     fastapi_users.get_auth_router(auth_backend),
     prefix="/auth/jwt",
@@ -68,16 +70,17 @@ app.include_router(
     tags=["auth"],
 )
 
-# --- Endpoint для /chat ---
-@app.post("/chat", tags=["ai"])
+# =========== AI ROUTER: все ассистентные endpoint’ы через /ai ============
+ai_router = APIRouter(prefix="/ai", tags=["ai"])
+
+@ai_router.post("/chat")
 async def chat(
-    request: Request,
+    payload: ChatRequest,
     user=Depends(require_active_subscription),
     session: AsyncSession = Depends(lambda: SessionLocal()),
 ):
-    data = await request.json()
-    content = data.get("content")
-    msg_type = data.get("type", "text")
+    content = payload.content
+    msg_type = payload.type
 
     if msg_type != "text":
         raise HTTPException(status_code=400, detail="Мультимодальность пока не реализована.")
@@ -118,52 +121,31 @@ async def chat(
 
     return JSONResponse({"reply": reply, "meta": usage})
 
-
-# --- История сообщений пользователя ---
-@app.get("/history", tags=["ai"])
-async def history(
-    user=Depends(require_active_subscription),
-    session: AsyncSession = Depends(lambda: SessionLocal()),
-    limit: int = 50,
-):
-    result = await session.execute(
-        Message.__table__.select()
-        .where(Message.user_id == user.id)
-        .order_by(Message.created_at.desc())
-        .limit(limit)
-    )
-    messages = [dict(row) for row in result.fetchall()]
-    return messages
-
-
-# --- Healthcheck ---
-@app.get("/health", tags=["health"])
+@ai_router.get("/health", tags=["health"])
 async def health():
     return {"status": "ok"}
 
-
-# --- Email-поддержка ---
-@app.post("/support", tags=["support"])
+@ai_router.post("/support")
 async def support_request(
-    request: Request,
+    payload: SupportRequest,
     user=Depends(require_active_subscription)
 ):
-    data = await request.json()
-    subject = data.get("subject", "Support request")
-    message = data.get("message", "")
     await send_email(
         to=SUPPORT_EMAIL,
-        subject=f"[SUPPORT] {subject}",
-        body=message,
+        subject=f"[SUPPORT] {payload.subject}",
+        body=payload.message,
         from_email=user.email,
     )
     return {"status": "sent"}
 
-
-# --- Сквозная аналитика ---
+# ------------------ Сквозная аналитика ------------------
 @app.middleware("http")
 async def add_analytics_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-GA-Measurement-Id"] = GA_MEASUREMENT_ID or ""
     response.headers["X-Metrika-Id"] = METRIKA_ID or ""
     return response
+
+# ------------------ Включаем ai_router ------------------
+app.include_router(ai_router)
+

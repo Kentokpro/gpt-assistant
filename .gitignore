@@ -36,3 +36,8 @@ media/
 uploads/
 tmp/
 *.tmp
+
+alembic.ini
+*.env
+.env.*
+.env

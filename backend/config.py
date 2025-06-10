@@ -32,7 +32,7 @@ CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8001"))
 ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "").split(",")
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").split(",")
-SECURE_COOKIES = os.getenv("SECURE_COOKIES", "true").lower() == "true"
+SECURE_COOKIES = os.getenv("SECURE_COOKIES", "false").lower() == "true"
 CSRF_ENABLED = os.getenv("CSRF_ENABLED", "true").lower() == "true"
 SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "sessionid")
 
@@ -42,7 +42,7 @@ SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-EMAIL_RESET_TOKEN_EXPIRE_HOURS = int(os.getenv("EMAIL_RESET_TOKEN_EXPIRE_HOURS", "24"))
+EMAIL_RESET_TOKEN_EXPIRE_HOURS = int(os.getenv("EMAIL_RESET_TOKEN_EXPIRE_HOURS", "48"))
 EMAIL_TEMPLATES_DIR = os.getenv("EMAIL_TEMPLATES_DIR", "./email-templates")
 SUPPORT_EMAIL = os.getenv("SUPPORT_EMAIL", EMAILS_FROM_EMAIL)
 

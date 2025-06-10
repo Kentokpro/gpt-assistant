@@ -3,6 +3,32 @@ from pydantic import BaseModel, EmailStr, UUID4
 from datetime import datetime
 from fastapi_users.schemas import BaseUser, BaseUserCreate, BaseUserUpdate
 
+# --- Pydantic-модель для chat endpoint ---
+class ChatRequest(BaseModel):
+    content: str
+    type: str = "text"
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "content": "Привет, ассистент!",
+                "type": "text"
+            }
+        }
+
+# --- Pydantic-модель для поддержки ---
+class SupportRequest(BaseModel):
+    subject: Optional[str] = "Support request"
+    message: str
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "subject": "Проблема с подпиской",
+                "message": "Не получается продлить подписку, выдает ошибку оплаты."
+            }
+        }
+
 # --- LeadRequest (новый класс для лида) ---
 class LeadRequest(BaseModel):
     user_id: str
@@ -63,7 +89,6 @@ class LeadRequest(BaseModel):
                 "original_id": "2fa6ee1"
             }
         }
-
 
 # --- User schemas ---
 class UserRead(BaseUser):

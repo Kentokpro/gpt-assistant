@@ -34,11 +34,27 @@ fastapi_users = FastAPIUsers[User, uuid.UUID](
     [auth_backend],
 )
 
-current_active_user = fastapi_users.current_user(active=True)
-current_superuser = fastapi_users.current_user(superuser=True)
+fastapi_users = FastAPIUsers[User, uuid.UUID](
+    get_user_manager,
+    [auth_backend],
+)
 
-# Проверка активной подписки — только для активных пользователей
+fastapi_users = FastAPIUsers[User, uuid.UUID](
+    get_user_manager,
+    [auth_backend],
+)
+current_active_user = fastapi_users.current_user(active=True)
+
+WHITELIST_EMAILS = {
+    'kdmitrievich1994@gmail.com',
+    'Test2@mail.com',
+    'Test3@mail.com'
+}
+
 async def require_active_subscription(user=Depends(current_active_user)):
+    if user.email in WHITELIST_EMAILS:
+        return user
+
     async with SessionLocal() as session:
         result = await session.execute(
             select(Subscription)
