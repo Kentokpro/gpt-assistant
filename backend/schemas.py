@@ -1,6 +1,7 @@
-from typing import Any, Optional, List
+from typing import Any, Optional, List, Dict
 from pydantic import BaseModel, EmailStr, UUID4
 from datetime import datetime
+from fastapi_users.schemas import BaseUser, BaseUserCreate, BaseUserUpdate
 
 # --- LeadRequest (новый класс для лида) ---
 class LeadRequest(BaseModel):
@@ -65,17 +66,7 @@ class LeadRequest(BaseModel):
 
 
 # --- User schemas ---
-class UserBase(BaseModel):
-    email: EmailStr
-    display_name: Optional[str] = None
-    is_active: Optional[bool] = True
-    is_superuser: Optional[bool] = False
-    is_verified: Optional[bool] = False
-    phone: Optional[str] = None
-    tags: Optional[dict] = None
-    referral_code: Optional[str] = None
-
-class UserRead(UserBase):
+class UserRead(BaseUser):
     id: UUID4
     created_at: Optional[datetime]
     updated_at: Optional[datetime]
@@ -83,13 +74,17 @@ class UserRead(UserBase):
     class Config:
         orm_mode = True
 
-class UserCreate(UserBase):
-    password: str
-
-class UserUpdate(BaseModel):
+class UserCreate(BaseUserCreate):
     display_name: Optional[str] = None
     phone: Optional[str] = None
-    tags: Optional[dict] = None
+    tags: Optional[Dict] = None
+    referral_code: Optional[str] = None
+
+class UserUpdate(BaseUserUpdate):
+    display_name: Optional[str] = None
+    phone: Optional[str] = None
+    tags: Optional[Dict] = None
+    referral_code: Optional[str] = None
 
 # --- Subscription schemas ---
 class SubscriptionBase(BaseModel):

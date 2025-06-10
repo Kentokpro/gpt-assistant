@@ -1,4 +1,4 @@
-from fastapi import Request, HTTPException, status
+from fastapi import Depends, HTTPException, status
 from fastapi_users import FastAPIUsers
 from fastapi_users.authentication import JWTStrategy, CookieTransport, AuthenticationBackend
 from backend.models import User, Subscription
@@ -9,7 +9,11 @@ from backend.database import SessionLocal
 from backend.user_manager import get_user_manager
 
 def get_jwt_strategy():
-    return JWTStrategy(secret=SECRET_KEY, lifetime_seconds=60 * 60 * 24 * 7, token_audience="fastapi-users")
+    return JWTStrategy(
+        secret=SECRET_KEY,
+        lifetime_seconds=60 * 60 * 24 * 7,  # 7 дней
+        token_audience="fastapi-users"
+    )
 
 cookie_transport = CookieTransport(
     cookie_name=SESSION_COOKIE_NAME,
@@ -25,26 +29,16 @@ auth_backend = AuthenticationBackend(
     get_strategy=get_jwt_strategy,
 )
 
-# Конструктор FastAPIUsers без схем — ты их задаёшь в main.py при регистрации
-fastapi_users = FastAPIUsers[User, uuid.UUID](get_user_manager, [auth_backend])
+fastapi_users = FastAPIUsers[User, uuid.UUID](
+    get_user_manager,
+    [auth_backend],
+)
 
-# Функция декодирования токена — используется если нужно вручную
-def decode_jwt_token(token: str):
-    from jose import jwt, JWTError
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        return payload
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Упс, для доступа к AI нужна подписка",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+current_active_user = fastapi_users.current_user(active=True)
+current_superuser = fastapi_users.current_user(superuser=True)
 
-# 🔥 Главное: безопасная проверка активной подписки БЕЗ Depends(current_user)
-async def require_active_subscription(request: Request):
-    user = await fastapi_users.current_user(active=True)(request)
-
+# Проверка активной подписки — только для активных пользователей
+async def require_active_subscription(user=Depends(current_active_user)):
     async with SessionLocal() as session:
         result = await session.execute(
             select(Subscription)
