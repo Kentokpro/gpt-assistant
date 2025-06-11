@@ -28,7 +28,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 app = FastAPI(
     title="Leadinc AI Assistant",
     description="AI SaaS Assistant (B2B)",
-    debug=DEBUG
+    debug=DEBUG,
+    docs_url=None,      # отключить /docs
+    redoc_url=None,     # отключить /redoc
+    openapi_url=None    # отключить /openapi.json
 )
 
 # ------------------ Логирование ------------------
@@ -54,6 +57,10 @@ app.add_middleware(
 MEDIA_DIR = Path(__file__).parent / "media"
 MEDIA_DIR.mkdir(exist_ok=True)
 app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
+
+STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # ------------------ Auth routers -----------------
 app.include_router(
