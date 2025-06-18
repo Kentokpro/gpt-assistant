@@ -44,6 +44,7 @@ fastapi_users = FastAPIUsers[User, uuid.UUID](
     [auth_backend],
 )
 current_active_user = fastapi_users.current_user(active=True)
+current_active_user_optional = fastapi_users.current_user(optional=True, active=True)
 
 WHITELIST_EMAILS = {
     'kdmitrievich1994@gmail.com',
