@@ -20,20 +20,22 @@ print("DEBUG: MAIN.PY location:", __file__)
 print("DEBUG: Working directory:", os.getcwd())
 
 redis = aioredis.from_url("redis://localhost:6379", decode_responses=True)
-
 password_helper = PasswordHelper()
 
 async def send_to_telegram_bot(email, phone, password):
     async with httpx.AsyncClient() as client:
         await client.post(
-            "http://tg-bot-endpoint/send-login",
+            "http://tg-bot-endpoint/send-login",  # заменить на реальный endpoint!
             json={"email": email, "phone": phone, "password": password}
         )
 
 def get_or_create_session_id(request: Request) -> str:
     session_id = request.cookies.get("sessionid")
-    if session_id:
-        return session_id
+    try:
+        if session_id and uuid.UUID(session_id):
+            return session_id
+    except Exception:
+        pass
     return str(uuid.uuid4())
 
 def is_valid_phone(phone: str) -> bool:
@@ -41,6 +43,10 @@ def is_valid_phone(phone: str) -> bool:
 
 def is_valid_email(email: str) -> bool:
     return bool(re.fullmatch(r"[^@ \t\r\n]+@[^@ \t\r\n]+\.[^@ \t\r\n]+", email))
+
+def extract_code(text: str):
+    match = re.search(r"\b\d{6}\b", text)
+    return match.group() if match else None
 
 from backend.auth import (
     fastapi_users, auth_backend, require_active_subscription, current_active_user_optional
@@ -50,7 +56,7 @@ from backend.config import (
 )
 from backend.email_utils import send_email
 from backend.openai_utils import ask_openai
-from backend.models import User, Message, Session
+from backend.models import User, Message, Session as SessionModel
 from backend.schemas import UserRead, UserCreate, ChatRequest, SupportRequest
 from backend.database import SessionLocal
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,8 +70,18 @@ app = FastAPI(
     openapi_url=None
 )
 
-logging.basicConfig(level=LOG_LEVEL)
+LOG_PATH = "/root/ai-assistant/backend/leadinc-backend.log"
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger("leadinc-backend")
+logger.info("Leadinc backend стартовал успешно!")
 
 ALLOWED_ORIGINS = [
     "https://leadinc.ru",
@@ -109,16 +125,6 @@ MESSAGE_LIMITS = [15, 20, 20]   # Этапы 1-3
 PROJECT_LIMIT_PER_DAY = 5
 USER_LIMIT = 30                 # Этап 4: 30 сообщений за 10 минут
 
-def get_stage(msg_count):
-    if msg_count < MESSAGE_LIMITS[0]:
-        return 1
-    elif msg_count < sum(MESSAGE_LIMITS[:2]):
-        return 2
-    elif msg_count < sum(MESSAGE_LIMITS):
-        return 3
-    else:
-        return 4
-
 def current_timestamp():
     return int(time.time())
 
@@ -136,16 +142,89 @@ async def chat(
     content = payload.content
     msg_type = payload.type
     session_id = get_or_create_session_id(request)
-    lim_prefix = f"{user.id}" if user else session_id
 
-    msg_count_key = f"msg_count:{lim_prefix}"
+    client_ip = request.client.host
+    ip_sessions_key = f"sessions_per_ip:{client_ip}:{time.strftime('%Y-%m-%d')}"
+    current_sessions = int(await redis.get(ip_sessions_key) or 0)
+
+    session_db_obj = await session.execute(
+        select(SessionModel).where(SessionModel.id == session_id)
+    )
+    session_obj = session_db_obj.scalar_one_or_none()
+    if not session_obj:
+        if current_sessions >= 5:
+            return JSONResponse({
+                "reply": "Лимит сессий превышен. Обратитесь в поддержку.",
+                "meta": {"stage": 1, "reason": "ip_session_limit"}
+            })
+        await redis.incr(ip_sessions_key)
+        await redis.expire(ip_sessions_key, 86400)
+        session.add(SessionModel(id=session_id))
+        await session.commit()
+
+    lim_prefix = f"{user.id}" if user else session_id
+    logger.info(f"SessionID from cookie: {request.cookies.get('sessionid')}, Using: {session_id}")
+    stage_key = f"stage:{session_id}"
+
+    try:
+        stage = int(await redis.get(stage_key) or 1)
+    except Exception:
+        stage = 1
+
+    msg_count_key = f"msg_count:{lim_prefix}:stage{stage}"
     msg_count = int(await redis.get(msg_count_key) or 0)
 
-    # --- Stage & лимиты по этапам ---
-    stage = get_stage(msg_count)
+    ip_flood_key = f"code_flood:{client_ip}"
+    flood_attempts = int(await redis.get(ip_flood_key) or 0)
+    if flood_attempts > 15:  # максимум 15 попыток на IP за 10 минут
+        return JSONResponse({
+            "reply": "Слишком много попыток ввода кода с вашего IP. Подождите 10 минут и попробуйте снова.",
+            "meta": {"stage": stage, "reason": "ip_flood"}
+        })
+
+    user_code = extract_code(content)
+    if stage == 1 and user_code:
+        await redis.incr(ip_flood_key)
+        await redis.expire(ip_flood_key, 600)
+        is_real_code = await redis.exists(f"real_code:{user_code}")
+        is_used_code = await redis.exists(f"code_used:{user_code}")
+        if not is_real_code:
+            return JSONResponse({
+                "reply": "Введённый код не найден. Пожалуйста, запросите новый код в Telegram-боте.",
+                "meta": {"stage": 1}
+            })
+        if is_used_code:
+            return JSONResponse({
+                "reply": "Этот код уже был использован. Запросите новый код в Telegram-боте.",
+                "meta": {"stage": 1}
+            })
+        await redis.set(stage_key, 2, ex=12*60*60)
+        await redis.set(f"code_used:{user_code}", 1, ex=86400)
+        await redis.delete(f"real_code:{user_code}")
+        for n in range(1, 5):
+            if n != 2:
+                await redis.delete(f"msg_count:{lim_prefix}:stage{n}")
+        return JSONResponse({
+            "reply": "Код принят! Теперь расскажи о своём бизнесе и регионе (город/область), чтобы подобрать клиентов.",
+            "meta": {"stage": 2}
+        })
+
+    # --- Переход с этапа 2 на 3 (ниша и город указаны) ---
+    if stage == 2:
+        has_niche = any(x in content.lower() for x in ["штукатурка", "курсы", "обучение", "натяжные потолки"])
+        has_city = any(x in content.lower() for x in ["москва", "спб", "казань", "регион", "город"])
+        if has_niche and has_city:
+            await redis.set(stage_key, 3, ex=12*60*60)
+            for n in range(1, 5):
+                if n != 3:
+                    await redis.delete(f"msg_count:{lim_prefix}:stage{n}")
+            return JSONResponse({
+                "reply": "Принято! Теперь для полного доступа введи номер телефона и e-mail (пример: +79998887766 example@mail.ru).",
+                "meta": {"stage": 3}
+            })
+
     # -- Проектные лимиты только для авторизованных --
     if user:
-        # Считаем проекты по user.id + дате
         today = time.strftime("%Y-%m-%d")
         project_limit_key = f"project_count:{user.id}:{today}"
         project_count = int(await redis.get(project_limit_key) or 0)
@@ -173,7 +252,6 @@ async def chat(
             return resp
 
     else:
-        # --- Этап 1 ---
         if stage == 1 and msg_count >= MESSAGE_LIMITS[0]:
             await redis.delete(msg_count_key)
             resp = JSONResponse({
@@ -182,7 +260,6 @@ async def chat(
             })
             resp.set_cookie(key="sessionid", value=session_id, max_age=12 * 60 * 60, httponly=True, secure=False, samesite="Lax")
             return resp
-        # --- Этап 2 ---
         elif stage == 2 and msg_count >= sum(MESSAGE_LIMITS[:2]):
             await redis.delete(msg_count_key)
             resp = JSONResponse({
@@ -191,7 +268,6 @@ async def chat(
             })
             resp.set_cookie(key="sessionid", value=session_id, max_age=12 * 60 * 60, httponly=True, secure=False, samesite="Lax")
             return resp
-        # --- Этап 3 ---
         elif stage == 3 and msg_count >= sum(MESSAGE_LIMITS):
             await redis.delete(msg_count_key)
             resp = JSONResponse({
@@ -206,14 +282,14 @@ async def chat(
         await redis.incr(msg_count_key)
         await redis.expire(msg_count_key, 600)
 
-    # --- Защита от флуд-атаки (анализ временного окна для гостей) ---
+    # --- Защита от флуд-атаки для гостей ---
     if not user:
         zset_key = f"guest_flood:{session_id}"
         now = current_timestamp()
         await redis.zremrangebyscore(zset_key, 0, ten_minutes_ago())
         await redis.zadd(zset_key, {str(now): now})
         guest_msgs = await redis.zcount(zset_key, ten_minutes_ago(), now)
-        if guest_msgs > 20:  # максимум 20 сообщений за 10 минут у гостя
+        if guest_msgs > 20:
             resp = JSONResponse({
                 "reply": "Слишком много сообщений за короткое время. Попробуйте позже.",
                 "meta": {"stage": stage, "reason": "flood"}
@@ -221,8 +297,8 @@ async def chat(
             resp.set_cookie(key="sessionid", value=session_id, max_age=12 * 60 * 60, httponly=True, secure=False, samesite="Lax")
             return resp
 
-    # --- РЕГИСТРАЦИЯ и АВТО-ЛОГИН ---
-    if "регистрация" in content.lower():
+    # --- РЕГИСТРАЦИЯ и АВТО-ЛОГИН (переход на этап 4) ---
+    if stage == 3:
         parts = content.split()
         phone = next((p for p in parts if p.startswith("+7")), None)
         email = next((p for p in parts if "@" in p), None)
@@ -255,33 +331,39 @@ async def chat(
             )
             session.add(user_obj)
             await session.commit()
-            
-            # Привязка истории сообщений к user_id
+
+            try:
+                await send_to_telegram_bot(email, phone, password)
+                logger.info(f"Отправлено в ТГ-бот: {email}, {phone}, {password}")
+            except Exception as e:
+                logger.error(f"Ошибка отправки в ТГ-бот: {e}")
+
             await session.execute(
                 update(Message)
                 .where(Message.session_id == session_id, Message.user_id == None)
                 .values(user_id=user_obj.id)
             )
             await session.commit()
-            
-            # --- Авто-логин (выдача токена через fastapi-users) ---
-            # Получить токен через fastapi-users и вернуть его клиенту (пример):
+
             from fastapi_users.authentication import JWTStrategy
             jwt_strategy = fastapi_users.get_jwt_strategy()
             token = await jwt_strategy.write_token(user_obj)
-            
-            await redis.delete(msg_count_key)
+
+            await redis.set(stage_key, 4, ex=12*60*60)
+            for n in range(1, 5):
+                if n != 4:
+                    await redis.delete(f"msg_count:{lim_prefix}:stage{n}")
+
             await redis.delete(attempts_key)
             today = time.strftime("%Y-%m-%d")
             await redis.set(f"project_count:{user_obj.id}:{today}", 0, ex=86400)
-            
+
             reg_response = JSONResponse({
                 "reply": "Регистрация завершена! Вы автоматически авторизованы. Пароль отправлен в Telegram.",
                 "token": token,
                 "meta": {"stage": 4}
             })
             reg_response.set_cookie(key="sessionid", value=session_id, max_age=12 * 60 * 60, httponly=True, secure=False, samesite="Lax")
-            # await send_to_telegram_bot(email, phone, password)
             logger.info(f"Generated password for {email}: {password}")
             return reg_response
         else:
@@ -290,6 +372,7 @@ async def chat(
             reg_response = JSONResponse({"reply": "Некорректный телефон или почта.", "meta": {}})
             reg_response.set_cookie(key="sessionid", value=session_id, max_age=12 * 60 * 60, httponly=True, secure=False, samesite="Lax")
             return reg_response
+
     # --- Остальная логика ассистента: OpenAI, сохранение сообщений, инкремент проектов ---
     try:
         openai_result = await ask_openai(content, msg_type)
@@ -324,7 +407,6 @@ async def chat(
         session.add(assistant_msg)
         await session.commit()
 
-        # --- Если пользователь авторизован и запрос связан с созданием проекта ---
         if user and ("создать проект" in content.lower() or "новый проект" in content.lower()):
             today = time.strftime("%Y-%m-%d")
             project_limit_key = f"project_count:{user.id}:{today}"
@@ -333,9 +415,34 @@ async def chat(
     except Exception as e:
         logger.error(f"DB error: {str(e)}")
 
-    response_data = {"reply": reply, "meta": usage, "stage": (get_stage(msg_count) if not user else 4)}
+    response_data = {"reply": reply, "meta": usage, "stage": stage}
+
+    def is_dashboard_query(content: str) -> bool:
+        key_phrases = [
+            "аналитика", "покажи аналитику", "какая аналитика",
+            "статистика", "дай данные", "какая динамика", "dashboard",
+            "есть инфа по", "есть информация по", "покажи спрос"
+        ]
+        lc = content.lower()
+        return any(k in lc for k in key_phrases)
+
+    if is_dashboard_query(content):
+        response_data["reply"] = "Данные по вашему запросу отображены на дашборде."
+        response_data["dashboard"] = {
+            "table": [
+                {"№": "1", "Ключевой запрос": "вездеход", "упоминаний": "8", "Категория": "Вездеходы"},
+                {"№": "2", "Ключевой запрос": "профи", "упоминаний": "5", "Категория": "Снегоходы"},
+                {"№": "3", "Ключевой запрос": "мтлб", "упоминаний": "4", "Категория": "Спецтехника"}
+            ],
+            "analytics": (
+                "Самые популярные поисковые запросы — «вездеход» и «профи», что говорит о высоком спросе на универсальные машины и брендированные решения.\n"
+                "По категориям лидируют классические вездеходы, болотоходы и спецтехника, заметна растущая доля электромоделей и квадроциклов.\n"
+                "Среди брендов доминирует «профи», есть рост DIY-платформ (самодельные, гусеничные)."
+            )
+        }
 
     response = JSONResponse(response_data)
+    # -- Гостю сетим UUID-сессию только если её не было --
     if not request.cookies.get("sessionid"):
         response.set_cookie(
             key="sessionid",

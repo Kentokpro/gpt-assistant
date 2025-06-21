@@ -7,11 +7,15 @@ backend/.env.backend
 
 # Данные и дампы
 *.log
+logs/
+backup*/
 *.bak
 *.sql
 *.gz
 *.dump
 *.tar
+*.tar.gz
+*.sql
 *.zip
 *.pkl
 *.json
@@ -36,8 +40,18 @@ media/
 uploads/
 tmp/
 *.tmp
+static/
 
 alembic.ini
 *.env
 .env.*
 .env
+
+# Virtualenvs
+venv/
+*/venv/
+
+# Data volumes
+db_data/
+redis_data/
+chroma_data/

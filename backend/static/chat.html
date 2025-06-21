@@ -133,7 +133,7 @@
       cursor: pointer; transition: filter .14s;
       box-shadow: 0 0 16px 2px #27fff8b3;
     }
-    #chat-send:hover { filter: brightness(1.1); }
+    #chat-send:hover { filter: brightness(1.1); } 
     ::selection { background: #10ffa388; }
     @media (max-width: 600px) {
       #container { width: 97vw; height: 96vh; min-width: 0; }
@@ -143,17 +143,15 @@
 </head>
 <body>
   <div id="container">
-    <!-- Логин-блок -->
-    <div id="login-block" class="active">
+    <div id="login-block" class=""> <!-- Скрыт по-умолчанию, но не удалён! -->
       <h2 style="margin-bottom: 2px; color: #30ffd7;">Вход в GPT-ассистент</h2>
       <input id="login-email" class="neon-input" placeholder="Email">
       <input id="login-pass" class="neon-input" type="password" placeholder="Пароль">
       <button class="neon-btn" onclick="login()">Войти</button>
       <div id="login-error" style="color:#ff726f; margin-top:8px; min-height:20px"></div>
     </div>
-    <!-- Чат-блок -->
-    <div id="chat-block">
-      <button id="logout-btn" class="neon-btn">Выйти</button>
+    <div id="chat-block" class="active"> <!-- ВСЕГДА ОТКРЫТ ЧАТ для гостя -->
+      <button id="logout-btn" class="neon-btn" style="display:none;">Выйти</button>
       <div id="chat-messages"></div>
       <form id="chat-form" onsubmit="sendMsg(event)">
         <input id="chat-input" autocomplete="off" placeholder="Введите сообщение..." />
@@ -162,51 +160,42 @@
     </div>
   </div>
   <script>
-    // --- Автологин при наличии активной сессии ---
+    let isAuthorized = false; // Флаг текущей авторизации (этап 4)
+    const chatMsgs = document.getElementById('chat-messages');
+    const logoutBtn = document.getElementById('logout-btn');
+    const chatBlock = document.getElementById('chat-block');
+    const loginBlock = document.getElementById('login-block');
+
+    // --- При загрузке: чат открыт всегда ---
     window.addEventListener('DOMContentLoaded', async function() {
+      // Пробуем автоматический login по cookie (если уже авторизован)
       try {
         let resp = await fetch('/auth/users/me', { credentials: 'include' });
         if(resp.ok) {
-          document.getElementById('login-block').classList.remove('active');
-          document.getElementById('chat-block').classList.add('active');
-          setTimeout(()=>{document.getElementById('chat-input').focus()}, 100);
-          appendMsg('assistant', 'Привет! Я ваш Ai менеджер Leadinc, чем могу помочь?');
+          isAuthorized = true;
+          logoutBtn.style.display = "block";
+          loginBlock.classList.remove('active');
+          chatBlock.classList.add('active');
+          appendMsg('assistant', 'Вы авторизованы! Открыт полный функционал. Чем помочь?');
+        } else {
+          // Гость — чат открыт, но без флага авторизации (этап 1-3)
+          isAuthorized = false;
+          logoutBtn.style.display = "none";
+          loginBlock.classList.remove('active');
+          chatBlock.classList.add('active');
+          appendMsg('assistant', 'Ai менеджер Leadinc');
         }
-      } catch {}
+      } catch {
+        // На случай падения API, всё равно покажем чат (гостевой режим)
+        isAuthorized = false;
+        logoutBtn.style.display = "none";
+        loginBlock.classList.remove('active');
+        chatBlock.classList.add('active');
+        appendMsg('assistant', 'Ai менеджер Leadinc');
+      }
     });
 
-    // --- Logout ---
-    document.getElementById('logout-btn').onclick = async function() {
-      // Если есть бекенд endpoint для logout, дерни его. Если нет — просто сбрось фронт
-      try { await fetch('/auth/jwt/logout', { method: 'POST', credentials: 'include' }); } catch {}
-      document.getElementById('chat-block').classList.remove('active');
-      document.getElementById('login-block').classList.add('active');
-      document.getElementById('login-email').value = "";
-      document.getElementById('login-pass').value = "";
-      document.getElementById('login-error').textContent = "";
-      chatMsgs.innerHTML = "";
-      // Сбросить таймер авто-логаута
-      clearAutoLogout();
-    };
-
-    // --- Авто-логаут через 12 часов бездействия ---
-    let logoutTimer = null;
-    function startAutoLogout() {
-      clearAutoLogout();
-      logoutTimer = setTimeout(function() {
-        document.getElementById('logout-btn').click();
-        alert('Ваша сессия завершена автоматически через 12 часов.');
-      }, 12*60*60*1000); // 12 часов
-    }
-    function clearAutoLogout() {
-      if (logoutTimer) clearTimeout(logoutTimer);
-      logoutTimer = null;
-    }
-    // Запускай таймер на любое взаимодействие:
-    document.addEventListener('mousemove', startAutoLogout, true);
-    document.addEventListener('keydown', startAutoLogout, true);
-
-    // --- Авторизация ---
+    // --- Логин (ручной, через блок ввода) ---
     async function login() {
       let email = document.getElementById('login-email').value.trim();
       let pass = document.getElementById('login-pass').value;
@@ -225,11 +214,11 @@
         });
 
         if (resp.ok) {
-          document.getElementById('login-block').classList.remove('active');
-          document.getElementById('chat-block').classList.add('active');
-          setTimeout(()=>{document.getElementById('chat-input').focus()}, 100);
-          appendMsg('assistant', 'Привет! Я ваш Ai менеджер Leadinc, чем могу помочь?.');
-          startAutoLogout();
+          isAuthorized = true;
+          logoutBtn.style.display = "block";
+          loginBlock.classList.remove('active');
+          chatBlock.classList.add('active');
+          appendMsg('assistant', 'Авторизация успешна! Чем могу помочь?');
         } else {
           let data = await resp.json();
           if (typeof data.detail === 'string') {
@@ -246,8 +235,21 @@
         err.textContent = "Нет соединения с сервером";
       }
     }
+
+    // --- Logout ---
+    logoutBtn.onclick = async function() {
+      try { await fetch('/auth/jwt/logout', { method: 'POST', credentials: 'include' }); } catch {}
+      isAuthorized = false;
+      logoutBtn.style.display = "none";
+      chatBlock.classList.remove('active');
+      loginBlock.classList.add('active');
+      document.getElementById('login-email').value = "";
+      document.getElementById('login-pass').value = "";
+      document.getElementById('login-error').textContent = "";
+      chatMsgs.innerHTML = "";
+    };
+
     // --- Чат ---
-    const chatMsgs = document.getElementById('chat-messages');
     function appendMsg(role, text) {
       let row = document.createElement('div');
       row.className = "msg-row";
@@ -258,7 +260,6 @@
       if(role === "user") row.style.justifyContent = "flex-end";
       else row.style.justifyContent = "flex-start";
       chatMsgs.appendChild(row);
-      // анимация “печати”
       let i = 0;
       function print() {
         if(i <= text.length) {
@@ -269,6 +270,7 @@
       print();
       chatMsgs.scrollTop = chatMsgs.scrollHeight;
     }
+
     async function sendMsg(e) {
       e.preventDefault();
       let inp = document.getElementById('chat-input');
@@ -277,7 +279,8 @@
       appendMsg('user', msg);
       inp.value = '';
       chatMsgs.scrollTop = chatMsgs.scrollHeight;
-      startAutoLogout(); // сбросить таймер активности
+
+      // --- ВАЖНО: добавляем флаг авторизации для ассистента (backend сам всё разрулит) ---
       try {
         let resp = await fetch('/ai/chat', {
           method: 'POST',
@@ -288,11 +291,21 @@
         let data = await resp.json();
         let reply = data.reply || '[Нет ответа]';
         appendMsg('assistant', reply);
+
+        // --- Если backend возвращает токен (авторизация после регистрации) ---
+        if (data.token) {
+          isAuthorized = true;
+          logoutBtn.style.display = "block";
+          loginBlock.classList.remove('active');
+          chatBlock.classList.add('active');
+          appendMsg('assistant', 'Вы успешно авторизованы! Открыт полный функционал.');
+        }
       } catch {
         appendMsg('assistant', "[Ошибка: нет связи с сервером]");
       }
     }
-    // Фокус на инпут по Enter на логине
+
+    // --- Фокус на инпут по Enter на логине
     document.getElementById('login-pass').addEventListener('keydown', function(e){
       if(e.key === "Enter") login();
     });
