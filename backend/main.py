@@ -4,74 +4,54 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-from typing import Any
-import os
-import re
-import httpx
+from fastapi import Body
 import uuid
-import redis.asyncio as aioredis
 import time
+import re
+import os
+
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.future import select
+
+import redis.asyncio as aioredis
+
+from backend.auth import get_user_manager
 from backend.utils.passwords import generate_password
-from sqlalchemy import select, update
 from fastapi_users.password import PasswordHelper
-
-print("DEBUG: Any imported:", Any)
-print("DEBUG: MAIN.PY location:", __file__)
-print("DEBUG: Working directory:", os.getcwd())
-
-redis = aioredis.from_url("redis://localhost:6379", decode_responses=True)
-password_helper = PasswordHelper()
-
-async def send_to_telegram_bot(email, phone, password):
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            "http://tg-bot-endpoint/send-login",  # заменить на реальный endpoint!
-            json={"email": email, "phone": phone, "password": password}
-        )
-
-def get_or_create_session_id(request: Request) -> str:
-    session_id = request.cookies.get("sessionid")
-    try:
-        if session_id and uuid.UUID(session_id):
-            return session_id
-    except Exception:
-        pass
-    return str(uuid.uuid4())
-
-def is_valid_phone(phone: str) -> bool:
-    return bool(re.fullmatch(r"\+7\d{10}", phone))
-
-def is_valid_email(email: str) -> bool:
-    return bool(re.fullmatch(r"[^@ \t\r\n]+@[^@ \t\r\n]+\.[^@ \t\r\n]+", email))
-
-def extract_code(text: str):
-    match = re.search(r"\b\d{6}\b", text)
-    return match.group() if match else None
+from backend.models import Session as SessionModel
 
 from backend.auth import (
-    fastapi_users, auth_backend, require_active_subscription, current_active_user_optional
+    fastapi_users, auth_backend, require_active_subscription, current_active_user_optional, get_jwt_strategy
 )
 from backend.config import (
-    DEBUG, LOG_LEVEL, ADMIN_EMAIL, GA_MEASUREMENT_ID, METRIKA_ID, SUPPORT_EMAIL
+    DEBUG, LOG_LEVEL, ADMIN_EMAIL, GA_MEASUREMENT_ID, METRIKA_ID, SUPPORT_EMAIL, SESSION_COOKIE_NAME
 )
 from backend.email_utils import send_email
 from backend.openai_utils import ask_openai
 from backend.models import User, Message, Session as SessionModel
 from backend.schemas import UserRead, UserCreate, ChatRequest, SupportRequest
 from backend.database import SessionLocal
-from sqlalchemy.ext.asyncio import AsyncSession
 
-app = FastAPI(
-    title="Leadinc AI Assistant",
-    description="AI SaaS Assistant (B2B)",
-    debug=DEBUG,
-    docs_url=None,
-    redoc_url=None,
-    openapi_url=None
-)
+async def get_db():
+    async with SessionLocal() as session:
+        yield session
+
+async def clear_session_keys(sessionid: str):
+    keys = [
+        f"stage:{sessionid}",
+        f"reg_phone:{sessionid}",
+        f"reg_email:{sessionid}",
+        f"reg_attempts:{sessionid}",
+        f"msg_count:{sessionid}:stage1",
+        f"msg_count:{sessionid}:stage2",
+        f"msg_count:{sessionid}:stage3",
+        f"guest_flood:{sessionid}",
+    ]
+    for key in keys:
+        await redis.delete(key)
 
 LOG_PATH = "/root/ai-assistant/backend/leadinc-backend.log"
-
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -82,6 +62,98 @@ logging.basicConfig(
 )
 logger = logging.getLogger("leadinc-backend")
 logger.info("Leadinc backend стартовал успешно!")
+
+redis = aioredis.from_url("redis://localhost:6379", decode_responses=True)
+password_helper = PasswordHelper()
+
+engine = create_async_engine(
+    f"postgresql+asyncpg://{os.environ.get('POSTGRES_USER')}:{os.environ.get('POSTGRES_PASSWORD')}@{os.environ.get('POSTGRES_HOST')}:{os.environ.get('POSTGRES_PORT')}/{os.environ.get('POSTGRES_DB')}",
+    echo=True
+)
+
+
+def set_session_cookie(response: Response, session_id: str):
+    response.set_cookie(
+        key="sessionid",
+        value=session_id,
+        max_age=12 * 60 * 60,
+        httponly=True,
+        secure=not DEBUG,
+        samesite="Strict" if not DEBUG else "Lax"
+    )
+    logger.info(f"Set sessionid cookie: {session_id}")
+    print(f"Set sessionid cookie: {session_id}")
+    return response
+
+def get_or_create_session_id(request: Request) -> str:
+    session_id = request.cookies.get("sessionid")
+    try:
+        if session_id and uuid.UUID(session_id):
+            return session_id
+    except Exception:
+        pass
+    return str(uuid.uuid4())
+
+def current_timestamp():
+    return int(time.time())
+
+def ten_minutes_ago():
+    return int(time.time()) - 600
+
+def five_days():
+    return 5 * 24 * 60 * 60
+
+
+app = FastAPI(
+    title="Leadinc AI Assistant",
+    description="AI SaaS Assistant (B2B)",
+    debug=DEBUG,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
+)
+
+@app.get("/auth/users/me", tags=["auth"])
+async def get_current_user(user=Depends(current_active_user_optional)):
+    logger.info(f"Проверка авторизации: user={user}")
+    if user is None:
+        logger.warning("User не найден — считаем неавторизованным.")
+        return JSONResponse({"is_authenticated": False}, status_code=401)
+    return {
+        "is_authenticated": True,
+        "id": str(user.id),
+        "email": user.email,
+        "phone": user.phone
+    }
+
+@app.post("/auth/jwt/login_custom", tags=["auth"])
+async def login_custom(
+    request: Request,
+    username: str = Body(..., embed=True),  
+    password: str = Body(..., embed=True),
+    db: AsyncSession = Depends(get_db),
+    user_manager=Depends(get_user_manager)
+):
+    session_id = request.cookies.get("sessionid")
+    if not session_id:
+        session_id = str(uuid.uuid4())
+    result = await db.execute(
+        select(User).where((User.email == username) | (User.phone == username))
+    )
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=400, detail="Пользователь не найден")
+
+    password_helper = PasswordHelper()
+    verified, updated_password = password_helper.verify_and_update(password, user.hashed_password)    
+    if not verified:
+        raise HTTPException(status_code=400, detail="Неверный пароль")
+
+    jwt_strategy = get_jwt_strategy()
+    token = await jwt_strategy.write_token(user)
+    response = JSONResponse({"token": token, "email": user.email, "phone": user.phone})
+    response = set_session_cookie(response, session_id)
+    return response
 
 ALLOWED_ORIGINS = [
     "https://leadinc.ru",
@@ -121,15 +193,10 @@ app.include_router(
 
 ai_router = APIRouter(prefix="/ai", tags=["ai"])
 
-MESSAGE_LIMITS = [15, 20, 20]   # Этапы 1-3
-PROJECT_LIMIT_PER_DAY = 5
-USER_LIMIT = 30                 # Этап 4: 30 сообщений за 10 минут
+MESSAGE_LIMITS = [50, 20, 20]
+PROJECT_LIMIT_PER_DAY = 10
+USER_LIMIT = 30
 
-def current_timestamp():
-    return int(time.time())
-
-def ten_minutes_ago():
-    return int(time.time()) - 600
 
 @ai_router.post("/chat")
 async def chat(
@@ -137,321 +204,327 @@ async def chat(
     request: Request,
     response: Response,
     user: User = Depends(current_active_user_optional),
-    session: AsyncSession = Depends(lambda: SessionLocal()),
+    db: AsyncSession = Depends(get_db),
 ):
     content = payload.content
     msg_type = payload.type
     session_id = get_or_create_session_id(request)
 
-    client_ip = request.client.host
-    ip_sessions_key = f"sessions_per_ip:{client_ip}:{time.strftime('%Y-%m-%d')}"
-    current_sessions = int(await redis.get(ip_sessions_key) or 0)
+    logger.info(f"--- NEW CHAT REQ --- session={session_id} user={getattr(user, 'id', None)} content='{content[:40]}'")
 
-    session_db_obj = await session.execute(
-        select(SessionModel).where(SessionModel.id == session_id)
-    )
-    session_obj = session_db_obj.scalar_one_or_none()
-    if not session_obj:
-        if current_sessions >= 5:
-            return JSONResponse({
-                "reply": "Лимит сессий превышен. Обратитесь в поддержку.",
-                "meta": {"stage": 1, "reason": "ip_session_limit"}
-            })
-        await redis.incr(ip_sessions_key)
-        await redis.expire(ip_sessions_key, 86400)
-        session.add(SessionModel(id=session_id))
-        await session.commit()
+    phone_redis = await redis.get(f"reg_phone:{session_id}")
+    email_redis = await redis.get(f"reg_email:{session_id}")
+
+
+
+    if user:
+        stage = 4
+        logger.info(f"User is authorized. Forcing stage=4 for user_id={user.id}, session={session_id}")
+    else:
+        stage_key = f"stage:{session_id}"
+        raw_stage = await redis.get(stage_key)
+        if raw_stage is None:
+            stage = 1
+            await redis.set(stage_key, stage, ex=12*60*60)
+            logger.info(f"Stage for session {session_id} not found. Set to 1.")
+
+            async with db.begin():
+                q = select(SessionModel).where(SessionModel.id == session_id)
+                result = await db.execute(q)
+                existing = result.scalar_one_or_none()
+                if not existing:
+                    db.add(SessionModel(id=session_id))
+        else:
+            stage = int(raw_stage)
+            await redis.expire(stage_key, 12*60*60)
+            logger.info(f"Stage for session {session_id}: {stage}")
+
 
     lim_prefix = f"{user.id}" if user else session_id
-    logger.info(f"SessionID from cookie: {request.cookies.get('sessionid')}, Using: {session_id}")
-    stage_key = f"stage:{session_id}"
-
-    try:
-        stage = int(await redis.get(stage_key) or 1)
-    except Exception:
-        stage = 1
-
     msg_count_key = f"msg_count:{lim_prefix}:stage{stage}"
     msg_count = int(await redis.get(msg_count_key) or 0)
-
-    ip_flood_key = f"code_flood:{client_ip}"
-    flood_attempts = int(await redis.get(ip_flood_key) or 0)
-    if flood_attempts > 15:  # максимум 15 попыток на IP за 10 минут
-        return JSONResponse({
-            "reply": "Слишком много попыток ввода кода с вашего IP. Подождите 10 минут и попробуйте снова.",
-            "meta": {"stage": stage, "reason": "ip_flood"}
-        })
-
-    user_code = extract_code(content)
-    if stage == 1 and user_code:
-        await redis.incr(ip_flood_key)
-        await redis.expire(ip_flood_key, 600)
-        is_real_code = await redis.exists(f"real_code:{user_code}")
-        is_used_code = await redis.exists(f"code_used:{user_code}")
-        if not is_real_code:
-            return JSONResponse({
-                "reply": "Введённый код не найден. Пожалуйста, запросите новый код в Telegram-боте.",
-                "meta": {"stage": 1}
-            })
-        if is_used_code:
-            return JSONResponse({
-                "reply": "Этот код уже был использован. Запросите новый код в Telegram-боте.",
-                "meta": {"stage": 1}
-            })
-        await redis.set(stage_key, 2, ex=12*60*60)
-        await redis.set(f"code_used:{user_code}", 1, ex=86400)
-        await redis.delete(f"real_code:{user_code}")
-        for n in range(1, 5):
-            if n != 2:
-                await redis.delete(f"msg_count:{lim_prefix}:stage{n}")
-        return JSONResponse({
-            "reply": "Код принят! Теперь расскажи о своём бизнесе и регионе (город/область), чтобы подобрать клиентов.",
-            "meta": {"stage": 2}
-        })
-
-    # --- Переход с этапа 2 на 3 (ниша и город указаны) ---
-    if stage == 2:
-        has_niche = any(x in content.lower() for x in ["штукатурка", "курсы", "обучение", "натяжные потолки"])
-        has_city = any(x in content.lower() for x in ["москва", "спб", "казань", "регион", "город"])
-        if has_niche and has_city:
-            await redis.set(stage_key, 3, ex=12*60*60)
-            for n in range(1, 5):
-                if n != 3:
-                    await redis.delete(f"msg_count:{lim_prefix}:stage{n}")
-            return JSONResponse({
-                "reply": "Принято! Теперь для полного доступа введи номер телефона и e-mail (пример: +79998887766 example@mail.ru).",
-                "meta": {"stage": 3}
-            })
-
-    # -- Проектные лимиты только для авторизованных --
-    if user:
-        today = time.strftime("%Y-%m-%d")
-        project_limit_key = f"project_count:{user.id}:{today}"
-        project_count = int(await redis.get(project_limit_key) or 0)
-        if project_count >= PROJECT_LIMIT_PER_DAY:
-            resp = JSONResponse({
-                "reply": "На сегодня вы уже создали 5 проектов. Следующий можно будет создать завтра или по запросу через поддержку.",
-                "meta": {"stage": 4, "reason": "project_limit"}
-            })
-            resp.set_cookie(key="sessionid", value=session_id, max_age=12 * 60 * 60, httponly=True, secure=False, samesite="Lax")
-            return resp
-
-        # --- Лимит 30 сообщений за 10 минут (Redis ZSET) ---
-        zset_key = f"msg_zset:{user.id}"
-        now = current_timestamp()
-        await redis.zremrangebyscore(zset_key, 0, ten_minutes_ago())
-        import uuid
-        await redis.zadd(zset_key, {str(uuid.uuid4()): now})
-        msg_in_window = await redis.zcount(zset_key, ten_minutes_ago(), now)
-        if msg_in_window > USER_LIMIT:
-            resp = JSONResponse({
-                "reply": "Вы слишком активно отправляете сообщения. Пожалуйста, сделайте паузу.",
-                "meta": {"stage": 4, "reason": "msg_limit"}
-            })
-            resp.set_cookie(key="sessionid", value=session_id, max_age=12 * 60 * 60, httponly=True, secure=False, samesite="Lax")
-            return resp
-
-    else:
+    if not user:
         if stage == 1 and msg_count >= MESSAGE_LIMITS[0]:
             await redis.delete(msg_count_key)
-            resp = JSONResponse({
+            logger.warning(f"Stage 1: guest msg limit, session={session_id}")
+            return set_session_cookie(JSONResponse({
                 "reply": "Достигнут лимит сообщений. Для продолжения введите 6-значный код подтверждения из Telegram.",
-                "meta": {"stage": 1}
-            })
-            resp.set_cookie(key="sessionid", value=session_id, max_age=12 * 60 * 60, httponly=True, secure=False, samesite="Lax")
-            return resp
+                "meta": {"stage": 1, "reason": "guest_limit"}
+            }), session_id)
         elif stage == 2 and msg_count >= sum(MESSAGE_LIMITS[:2]):
             await redis.delete(msg_count_key)
-            resp = JSONResponse({
+            logger.warning(f"Stage 2: guest msg limit, session={session_id}")
+            return set_session_cookie(JSONResponse({
                 "reply": "Достигнут лимит сообщений. Пожалуйста, завершите регистрацию.",
-                "meta": {"stage": 2}
-            })
-            resp.set_cookie(key="sessionid", value=session_id, max_age=12 * 60 * 60, httponly=True, secure=False, samesite="Lax")
-            return resp
+                "meta": {"stage": 2, "reason": "guest_limit"}
+            }), session_id)
         elif stage == 3 and msg_count >= sum(MESSAGE_LIMITS):
             await redis.delete(msg_count_key)
-            resp = JSONResponse({
+            logger.warning(f"Stage 3: guest msg limit, session={session_id}")
+            return set_session_cookie(JSONResponse({
                 "reply": "Достигнут лимит сообщений. Для продолжения требуется регистрация.",
-                "meta": {"stage": 3}
-            })
-            resp.set_cookie(key="sessionid", value=session_id, max_age=12 * 60 * 60, httponly=True, secure=False, samesite="Lax")
-            return resp
-
-    # --- Инкремент счетчика сообщений и TTL (для этапов 1-3) ---
-    if not user:
-        await redis.incr(msg_count_key)
-        await redis.expire(msg_count_key, 600)
-
-    # --- Защита от флуд-атаки для гостей ---
-    if not user:
+                "meta": {"stage": 3, "reason": "guest_limit"}
+            }), session_id)
         zset_key = f"guest_flood:{session_id}"
         now = current_timestamp()
         await redis.zremrangebyscore(zset_key, 0, ten_minutes_ago())
         await redis.zadd(zset_key, {str(now): now})
         guest_msgs = await redis.zcount(zset_key, ten_minutes_ago(), now)
         if guest_msgs > 20:
-            resp = JSONResponse({
+            logger.warning(f"Flood protection: guest, session={session_id}")
+            return set_session_cookie(JSONResponse({
                 "reply": "Слишком много сообщений за короткое время. Попробуйте позже.",
                 "meta": {"stage": stage, "reason": "flood"}
-            })
-            resp.set_cookie(key="sessionid", value=session_id, max_age=12 * 60 * 60, httponly=True, secure=False, samesite="Lax")
-            return resp
+            }), session_id)
+        await redis.incr(msg_count_key)
+        await redis.expire(msg_count_key, 600)
 
-    # --- РЕГИСТРАЦИЯ и АВТО-ЛОГИН (переход на этап 4) ---
-    if stage == 3:
-        parts = content.split()
-        phone = next((p for p in parts if p.startswith("+7")), None)
-        email = next((p for p in parts if "@" in p), None)
-        valid_phone = is_valid_phone(phone) if phone else False
-        valid_email = is_valid_email(email) if email else False
+    if user:
+        today = time.strftime("%Y-%m-%d")
+        project_limit_key = f"project_count:{user.id}:{today}"
+        project_count = int(await redis.get(project_limit_key) or 0)
+        if project_count >= PROJECT_LIMIT_PER_DAY:
+            logger.warning(f"User project limit. user_id={user.id} session={session_id}")
+            return set_session_cookie(JSONResponse({
+                "reply": "На сегодня вы уже создали 5 проектов. Следующий можно будет создать завтра или по запросу через поддержку.",
+                "meta": {"stage": 4, "reason": "project_limit"}
+            }), session_id)
+        zset_key = f"msg_zset:{user.id}"
+        now = current_timestamp()
+        await redis.zremrangebyscore(zset_key, 0, ten_minutes_ago())
+        await redis.zadd(zset_key, {str(uuid.uuid4()): now})
+        msg_in_window = await redis.zcount(zset_key, ten_minutes_ago(), now)
+        if msg_in_window > USER_LIMIT:
+            logger.warning(f"User msg limit. user_id={user.id} session={session_id}")
+            return set_session_cookie(JSONResponse({
+                "reply": "Вы слишком активно отправляете сообщения. Пожалуйста, сделайте паузу.",
+                "meta": {"stage": 4, "reason": "msg_limit"}
+            }), session_id)
 
-        attempts_key = f"register:{lim_prefix}:fail_count"
-        attempts = int(await redis.get(attempts_key) or 0)
-        if attempts >= 10:
-            reg_response = JSONResponse({"reply": "Регистрация заблокирована. Слишком много ошибок. Попробуйте позже.", "meta": {}})
-            reg_response.set_cookie(key="sessionid", value=session_id, max_age=12 * 60 * 60, httponly=True, secure=False, samesite="Lax")
-            return reg_response
+    phone_redis = await redis.get(f"reg_phone:{session_id}")
+    email_redis = await redis.get(f"reg_email:{session_id}")
+    ai_response = await ask_openai(
+        content=content,
+        msg_type=msg_type,
+        stage=stage,
+        user_authenticated=bool(user),
+        phone=phone_redis,
+        email=email_redis
+    )
 
-        if valid_phone and valid_email:
-            password = generate_password(8)
-            password_hash = password_helper.hash(password)
-            q = select(User).where((User.phone == phone) | (User.email == email))
-            result = await session.execute(q)
-            existing = result.scalar_one_or_none()
-            if existing:
-                reg_response = JSONResponse({"reply": "Этот телефон или почта уже зарегистрированы.", "meta": {}})
-                reg_response.set_cookie(key="sessionid", value=session_id, max_age=12 * 60 * 60, httponly=True, secure=False, samesite="Lax")
-                return reg_response
-            user_obj = User(
-                email=email,
-                phone=phone,
-                hashed_password=password_hash,
-                is_active=True,
-                is_verified=True,
-            )
-            session.add(user_obj)
-            await session.commit()
+    new_stage = ai_response.get('stage', stage)
+    fields = ai_response.get('fields', {})
+    logger.info(f"AI response: stage={new_stage} fields={fields}")
 
-            try:
-                await send_to_telegram_bot(email, phone, password)
-                logger.info(f"Отправлено в ТГ-бот: {email}, {phone}, {password}")
-            except Exception as e:
-                logger.error(f"Ошибка отправки в ТГ-бот: {e}")
+    updated = False
+    if fields.get("phone") and fields["phone"] != phone_redis:
+        await redis.set(f"reg_phone:{session_id}", fields["phone"], ex=3600)
+        phone_redis = fields["phone"]
+        updated = True
+    if fields.get("email") and fields["email"] != email_redis:
+        await redis.set(f"reg_email:{session_id}", fields["email"], ex=3600)
+        email_redis = fields["email"]
+        updated = True
 
-            await session.execute(
-                update(Message)
-                .where(Message.session_id == session_id, Message.user_id == None)
-                .values(user_id=user_obj.id)
-            )
-            await session.commit()
+    phone_final = fields.get("phone") or phone_redis
+    email_final = fields.get("email") or email_redis
 
-            from fastapi_users.authentication import JWTStrategy
-            jwt_strategy = fastapi_users.get_jwt_strategy()
-            token = await jwt_strategy.write_token(user_obj)
+    if updated:
+        logger.info(f"[PATCH] reg_phone:{session_id}={phone_redis}, reg_email:{session_id}={email_redis}")
 
-            await redis.set(stage_key, 4, ex=12*60*60)
-            for n in range(1, 5):
-                if n != 4:
-                    await redis.delete(f"msg_count:{lim_prefix}:stage{n}")
+    if not user and stage == 1 and new_stage == 2:
+        user_code = fields.get("code")
+        if not user_code:
+            logger.warning(f"Код не найден в fields, stage=1→2, session={session_id}")
+            return set_session_cookie(JSONResponse({
+                "reply": "Код не распознан. Введите 6-значный код из Telegram.",
+                "meta": {"stage": 1, "reason": "code_missing"}
+            }), session_id)
+        code_key = f"real_code:{user_code}"
+        code_exists = await redis.exists(code_key)
+        if not code_exists:
+            logger.warning(f"Невалидный код: {user_code}, session={session_id}")
+            return set_session_cookie(JSONResponse({
+                "reply": "Введённый код неверен или устарел. Запросите новый код в Telegram-боте.",
+                "meta": {"stage": 1, "reason": "code_invalid"}
+            }), session_id)
+        await redis.delete(code_key)
+        logger.info(f"Код принят: {user_code}, session={session_id}")
 
-            await redis.delete(attempts_key)
-            today = time.strftime("%Y-%m-%d")
-            await redis.set(f"project_count:{user_obj.id}:{today}", 0, ex=86400)
-
-            reg_response = JSONResponse({
-                "reply": "Регистрация завершена! Вы автоматически авторизованы. Пароль отправлен в Telegram.",
-                "token": token,
-                "meta": {"stage": 4}
-            })
-            reg_response.set_cookie(key="sessionid", value=session_id, max_age=12 * 60 * 60, httponly=True, secure=False, samesite="Lax")
-            logger.info(f"Generated password for {email}: {password}")
-            return reg_response
+    allow = False
+    if user:
+        if new_stage == 4:
+            allow = True
         else:
-            await redis.incr(attempts_key)
-            await redis.expire(attempts_key, 3600)
-            reg_response = JSONResponse({"reply": "Некорректный телефон или почта.", "meta": {}})
-            reg_response.set_cookie(key="sessionid", value=session_id, max_age=12 * 60 * 60, httponly=True, secure=False, samesite="Lax")
-            return reg_response
+            logger.warning(f"User is authenticated, but AI tried to set stage={new_stage}. Forcing stage=4")
+            new_stage = 4
+            allow = True
+    else:
+        if new_stage == stage or new_stage == stage + 1:
+            allow = True
+        else:
+            logger.warning(f"Прыжок stage запрещён: {stage} → {new_stage}")
+            return set_session_cookie(JSONResponse({
+                "reply": "Ошибка этапа! Давай попробуем ещё раз по шагам.",
+                "meta": {"stage": stage, "reason": "stage_jump"}
+            }), session_id)
 
-    # --- Остальная логика ассистента: OpenAI, сохранение сообщений, инкремент проектов ---
-    try:
-        openai_result = await ask_openai(content, msg_type)
-        reply = openai_result["text"]
-        usage = openai_result["usage"]
-    except Exception as e:
-        logger.error(f"OpenAI error: {str(e)}")
-        raise HTTPException(status_code=500, detail="AI ошибка")
+    stage_key = f"stage:{session_id}"
+    if allow:
+        await redis.set(stage_key, new_stage, ex=12*60*60)
+        logger.info(f"Stage updated: {stage} → {new_stage} session={session_id}")
+
+    if not user and stage == 3 and new_stage == 4 and phone_final and email_final:
+        try:
+            async with db.begin():
+                q = select(User).where(
+                    (User.phone == phone_final) | (User.email == email_final)
+                )
+                result = await db.execute(q)
+                existing = result.scalar_one_or_none()
+                if existing:
+                    logger.info(f"Регистрация отклонена: телефон/почта заняты, session={session_id}")
+                    return set_session_cookie(JSONResponse({
+                        "reply": "Этот телефон или почта уже зарегистрированы.",
+                        "meta": {"stage": 3}
+                    }), session_id)
+                password = generate_password(8)
+                password_hash = password_helper.hash(password)
+                user_obj = User(
+                    email=email_final,
+                    phone=phone_final,
+                    hashed_password=password_hash,
+                    is_active=True,
+                    is_verified=True,
+                )
+                db.add(user_obj)
+                await db.flush()                 
+                q = select(SessionModel).where(SessionModel.id == session_id)
+                res = await db.execute(q)
+                session_db = res.scalar_one_or_none()
+                if session_db and not session_db.user_id:
+                    session_db.user_id = user_obj.id
+
+            jwt_strategy = get_jwt_strategy()
+            token = await jwt_strategy.write_token(user_obj)
+            dev_block = (
+                "\n\n------------------------\n"
+                "[альфа тест]\n"
+                "Вы зарегистрированы! Теперь вам доступен расширенный функционал Leadinc.\n"
+                f"Ваши данные для входа:\n"
+                f"Телефон: {phone_final}\n"
+                f"Email: {email_final}\n"
+                f"Пароль: {password}\n"
+                "Вы автоматически авторизованы.\n"
+                "------------------------"
+            )
+            ai_response["reply"] = (ai_response.get("reply") or "") + dev_block
+            logger.info(f"Новый пользователь зарегистрирован: email={email_final}, phone={phone_final}")
+            print(f"[DEBUG] Generated password for {email_final}: {password}")
+            logger.info(f"Final AI reply: {ai_response['reply']}")
+            await redis.delete(f"stage:{session_id}")
+            await redis.delete(f"reg_phone:{session_id}")
+            await redis.delete(f"reg_email:{session_id}")
+            await redis.delete(f"reg_attempts:{session_id}")
+            await redis.delete(f"msg_count:{session_id}:stage1")
+            await redis.delete(f"msg_count:{session_id}:stage2")
+            await redis.delete(f"msg_count:{session_id}:stage3")
+            await redis.delete(f"guest_flood:{session_id}")
+            await redis.expire(session_id, five_days())
+
+            response_data = {
+                "reply": ai_response["reply"],
+                "meta": {
+                    "stage": new_stage,
+                    "usage": ai_response.get("usage", {}),
+                    "fields": fields,
+                    "token": token,
+                    "login": email_final,
+                    "password": password
+                }
+            }
+            response = JSONResponse(response_data)
+            response.set_cookie(
+                key=SESSION_COOKIE_NAME,
+                value=session_id,
+                max_age=12 * 60 * 60,
+                httponly=True,
+                secure=not DEBUG,
+                samesite="Strict" if not DEBUG else "Lax"
+            )
+            response.set_cookie(
+                key="fastapiusersauth",
+                value=token,
+                max_age=12 * 60 * 60,
+                httponly=True,
+                secure=not DEBUG,
+                samesite="Strict" if not DEBUG else "Lax"
+            )
+            return response
+        except Exception as e:
+            logger.error(f"Ошибка при регистрации: {str(e)}")
+            return set_session_cookie(JSONResponse({
+                "reply": "Техническая ошибка регистрации. Попробуйте снова.",
+                "meta": {"stage": 3, "reason": "register_error"}
+        }), session_id)
 
     try:
         user_id = user.id if user else None
-        user_msg = Message(
-            session_id=session_id,
-            user_id=user_id,
-            role="user",
-            type=msg_type,
-            status="ok",
-            content=content,
-            meta={},
-        )
-        session.add(user_msg)
-        await session.commit()
-        assistant_msg = Message(
-            session_id=session_id,
-            user_id=user_id,
-            role="assistant",
-            type="text",
-            status="ok",
-            content=reply,
-            meta=usage,
-        )
-        session.add(assistant_msg)
-        await session.commit()
-
-        if user and ("создать проект" in content.lower() or "новый проект" in content.lower()):
-            today = time.strftime("%Y-%m-%d")
-            project_limit_key = f"project_count:{user.id}:{today}"
-            await redis.incr(project_limit_key)
-            await redis.expire(project_limit_key, 86400)
-    except Exception as e:
-        logger.error(f"DB error: {str(e)}")
-
-    response_data = {"reply": reply, "meta": usage, "stage": stage}
-
-    def is_dashboard_query(content: str) -> bool:
-        key_phrases = [
-            "аналитика", "покажи аналитику", "какая аналитика",
-            "статистика", "дай данные", "какая динамика", "dashboard",
-            "есть инфа по", "есть информация по", "покажи спрос"
-        ]
-        lc = content.lower()
-        return any(k in lc for k in key_phrases)
-
-    if is_dashboard_query(content):
-        response_data["reply"] = "Данные по вашему запросу отображены на дашборде."
-        response_data["dashboard"] = {
-            "table": [
-                {"№": "1", "Ключевой запрос": "вездеход", "упоминаний": "8", "Категория": "Вездеходы"},
-                {"№": "2", "Ключевой запрос": "профи", "упоминаний": "5", "Категория": "Снегоходы"},
-                {"№": "3", "Ключевой запрос": "мтлб", "упоминаний": "4", "Категория": "Спецтехника"}
-            ],
-            "analytics": (
-                "Самые популярные поисковые запросы — «вездеход» и «профи», что говорит о высоком спросе на универсальные машины и брендированные решения.\n"
-                "По категориям лидируют классические вездеходы, болотоходы и спецтехника, заметна растущая доля электромоделей и квадроциклов.\n"
-                "Среди брендов доминирует «профи», есть рост DIY-платформ (самодельные, гусеничные)."
+        async with db.begin():
+            user_msg = Message(
+                session_id=session_id,
+                user_id=user_id,
+                role="user",
+                type=msg_type,
+                status="ok",
+                content=content,
+                meta={},
             )
-        }
+            db.add(user_msg)
+            assistant_msg = Message(
+                session_id=session_id,
+                user_id=user_id,
+                role="assistant",
+                type="text",
+                status="ok",
+                content=ai_response["reply"],
+                meta=ai_response.get("usage", {}),
+            )
+            db.add(assistant_msg)
+    except Exception as e:
+        logger.error(f"DB error while saving messages: {str(e)}")
+        print(f"Return: DB error (messages), session={session_id}")
 
-    response = JSONResponse(response_data)
-    # -- Гостю сетим UUID-сессию только если её не было --
-    if not request.cookies.get("sessionid"):
-        response.set_cookie(
-            key="sessionid",
-            value=session_id,
-            max_age=12 * 60 * 60,
-            httponly=True,
-            secure=False,
-            samesite="Lax"
-        )
+    response_data = {
+        "reply": ai_response["reply"],
+        "meta": {
+            "stage": new_stage,
+            "usage": ai_response.get("usage", {}),
+            "fields": fields,
+            "token": ai_response.get("token")
+        }
+    }
+
+    logger.info(f"Final response: stage={new_stage}, session={session_id}, user={getattr(user, 'id', None)}")
+    print(f"Return: Final, session={session_id}, stage={new_stage}, cookie={session_id}")
+
+    return set_session_cookie(JSONResponse(response_data), session_id)
+
+@app.post("/auth/jwt/logout", tags=["auth"])
+async def logout(request: Request, response: Response):
+    session_id = request.cookies.get("sessionid")
+    if session_id:
+        await redis.delete(f"stage:{session_id}")
+        await redis.delete(f"reg_phone:{session_id}")
+        await redis.delete(f"reg_email:{session_id}")
+        await redis.delete(f"reg_attempts:{session_id}")
+        await redis.delete(f"msg_count:{session_id}:stage1")
+        await redis.delete(f"msg_count:{session_id}:stage2")
+        await redis.delete(f"msg_count:{session_id}:stage3")
+        await redis.delete(f"guest_flood:{session_id}")
+    response = JSONResponse({"detail": "Logout complete"})
+    response.delete_cookie(key="sessionid")
+    response.delete_cookie(key="fastapiusersauth")
     return response
 
 @ai_router.post("/support")

@@ -10,7 +10,7 @@ if env_path.exists():
 else:
     load_dotenv()  # fallback: ищет .env везде
 
-SECRET_KEY = os.getenv("SECRET")
+SECRET = os.getenv("SECRET")
 SECRET_ADMIN_TOKEN = os.getenv("SECRET_ADMIN_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 

@@ -24,7 +24,7 @@ class User(Base):
     referral_code = Column(String, nullable=True)
     tags = Column(JSON, nullable=True)
     # любые кастомные поля:
-    phone = Column(String, nullable=True)
+    phone = Column(String, unique=True, index=True, nullable=True)
 
     subscriptions = relationship("Subscription", back_populates="user")
     messages = relationship("Message", back_populates="user")

@@ -13,7 +13,8 @@ async def generate_code_api(payload: dict = Body(None)):
     code = generate_code()
     while await redis.exists(f"tgcode:{code}"):
         code = generate_code()
-    await redis.set(f"tgcode:{code}", "issued", ex=600)  # 10 минут TTL
+    await redis.set(f"tgcode:{code}", "issued", ex=600) 
+    await redis.set(f"real_code:{code}", "issued", ex=600)
     return {"code": code}
 
 @app.post("/api/verify-code")
