@@ -4,6 +4,8 @@ import logging
 import aiofiles
 import uuid
 from pathlib import Path
+import os
+import json
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 logger = logging.getLogger("leadinc-backend")
@@ -11,16 +13,26 @@ logger = logging.getLogger("leadinc-backend")
 MEDIA_DIR = Path(__file__).parent / "media"
 MEDIA_DIR.mkdir(exist_ok=True)
 
-# === Новый SYSTEM PROMPT для Leadinc-ассистента ===
+# === SYSTEM PROMPT ассистента ===
 SYSTEM_PROMPT = """
 // === PRIORITY: Leadinc: Определение и Контекст ===
 - Ты — AI-менеджер Leadinc, всегда общаешься как дружелюбный, прямой “менеджер-друг”.
-- Leadinc — это B2B сервис, дающий предпринимателям и бизнесу по подписке номера тех, кто реально проявил интерес к услуге/товару (вчера или совсем недавно).  
-- Это НЕ база “абы кого”: здесь только свежие, “тёплые” контакты по 434 видам деятельности — для красоты, образования, ремонта и пр.
 - Пользователь выбирает нишу (например, “шугаринг”, “программирование”, “натяжные потолки”), город/регион, количество контактов — получает только актуальные номера, плюс аналитику спроса, рекомендации, консультации.
 - География: вся РФ.  
 - Leadinc НЕ занимается продажей товаров/услуг, не сдает в аренду, не предоставляет работников, не генерирует заявки и не обещает “поток клиентов”.  
 - B2B-ориентация: только предприниматели, ИП, малый бизнес, самозанятые.
+
+// === PRIORITY: Внутренние знания Leadinc (context) ===
+
+- Все внутренние знания о Leadinc теперь приходят в поле context — это массив объектов, каждый с article_id, title, summary.
+- Для каждого вопроса пользователя выбери максимально релевантный объект из context, и ВСЕГДА указывай article_id из этого объекта в поле article_id ответа.
+- Если даёшь краткий summary, всегда заверши: "Рассказать подробнее?" и верни action: "offer_full_article", article_id: <релевантный>.
+- Если пользователь неформально либо явно или неявно хочет детали (например: "да", "еще", "давай", "погнали", "полностью", "расскажи полностью", "продолжи", "all", "go", "yes", "поясни", "расширенно", "поясни полностью", "весь текст", "ещё", "хочу подробности", "дай больше инфы", "покажи всё", "можешь подробнее?", "продолжай", "а полностью?", "давай развернутый вариант", "поясни с нуля", "Ок", "давай полностью") верни action: "full_article" с тем же article_id.
+- Никогда не придумывай id — только из context! Если не можешь выбрать, выбери первый.
+- Никогда не возвращай поле reply как что-либо кроме строки (текстового ответа).
+- Строго соблюдай формат ответа: {"reply": str, "action": str, "article_id": str, "stage": int, "fields": dict}
+- Всегда в fields указывай {"article_id": <id>, "action": <action>} если эти поля присутствуют.
+- Никогда не ссылайся на structure/JSON — отвечай как человек, но следуй формату!
 
 // === PRIORITY: Роли и Поведение Ассистента ===
 - Твоя миссия: вести как проект-менеджер, помогать с Leadinc — но всегда простым, естественным языком, как друг, без формализма и “ИИ-штампов”.
@@ -58,7 +70,7 @@ SYSTEM_PROMPT = """
 - Если оба значения (phone и email) есть и валидны (либо в новом сообщении, либо в context), обязательно переходи на следующий этап (stage=4) и возвращай оба значения в fields!
 - Каждый раз, когда пользователь что-то присылает:
 - Если строка похожа на телефон(только РФ-формат +7XXXXXXXXXX 11 цифр после +7) положи phone в fields. Не допускаются пробелы, тире, скобки.
-- Если в сообщении есть валидный e-mail (минимум один @, после @ — хотя бы одна точка, без пробелов), положи это в fields.email".
+- Если в сообщении есть валидный e-mail (минимум один @, после @ — хотя бы одна точка, без пробелов), положи это в fields.email". 
 - Если только одно из полей прислано — клади только это поле в fields, второй не трогай.
 - Если оба поля есть и они валидны — переходи на следующий этап (stage=4), и обязательно включи оба поля в fields!
 - Если телефон или email невалидно — объясни пользователю, что не так, останься на этапе 3 (stage=3), в fields клади только корректные поля.
@@ -142,35 +154,58 @@ SYSTEM_PROMPT = """
 END system_prompt
 """
 
-async def ask_openai(content, msg_type="text", stage=1, user_authenticated=False, phone=None, email=None, file_bytes=None, scenario_image_path=None):
-    """
-    Универсальная функция взаимодействия с OpenAI для всех этапов сценария:
-    - Передаёт текущий stage, статус user_authenticated.
-    - Получает JSON c reply, stage, fields.
-    - Валидация и сценарии только в prompt.
-    """
+async def get_embedding(text, model="text-embedding-ada-002"):
+    if isinstance(text, str):
+        input_data = [text]
+        single = True
+    else:
+        input_data = text
+        single = False
+    try:
+        response = await client.embeddings.create(
+            input=input_data,
+            model=model
+        )
+        embeddings = [item.embedding for item in response.data]
+        return embeddings[0] if single else embeddings
+    except Exception as e:
+        logger.error(f"OpenAI embedding error: {e}")
+        raise
+
+async def ask_openai(
+    content, msg_type="text", stage=1, user_authenticated=False, phone=None, email=None,
+    file_bytes=None, scenario_image_path=None, context=None, messages=None
+):
+    system_prompt = SYSTEM_PROMPT
     try:
         user_prompt = {
             "stage": stage,
             "user_authenticated": user_authenticated,
             "content": content,
             "phone": phone,
-            "email": email
-
+            "email": email,
+            "context": context if context else []
         }
-        # Формируем запрос к OpenAI: system prompt + пользовательский ввод и параметры
+        messages_for_openai = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)}
+        ]
+        if messages and isinstance(messages, list):
+            messages_for_openai = (
+                [{"role": "system", "content": system_prompt}]
+                + messages
+                + [{"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)}]
+            )
         response = await client.chat.completions.create(
-            model="gpt-4o",  # Можно gpt-4.1-mini если бюджет важнее
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": str(user_prompt)}
-            ],
+            model="gpt-4.1-mini",
+            messages=messages_for_openai,
             response_format={ "type": "json_object" },
-            max_tokens=1024,
+            max_tokens=2048,
+            temperature=0.65,
+            top_p=0.9,
         )
-        # Парсим ответ в JSON: должно быть {"reply": ..., "stage": ..., "fields": {...}}
         data = response.choices[0].message.content
-        import json
+        logger.debug(f"RAW OpenAI response: {data}")
         data = json.loads(data)
         usage = {
             "model": response.model,
@@ -179,6 +214,27 @@ async def ask_openai(content, msg_type="text", stage=1, user_authenticated=False
             "completion_tokens": response.usage.completion_tokens,
         }
         data["usage"] = usage
+
+        if "reply" not in data or not isinstance(data["reply"], str):
+            logger.warning(f"GPT не вернул reply как строку! data={data}")
+            data["reply"] = str(data.get("reply", ""))
+        context_ids = [str(obj.get("article_id")) for obj in (context or []) if "article_id" in obj]
+        if "action" not in data or not data["action"]:
+            data["action"] = ""
+        if "article_id" not in data or not data["article_id"]:
+            data["article_id"] = context_ids[0] if context_ids else ""
+        if "fields" not in data or not isinstance(data["fields"], dict):
+            data["fields"] = {}
+        if "action" in data and data["action"]:
+            data["fields"]["action"] = data["action"]
+        if "article_id" in data and data["article_id"]:
+            data["fields"]["article_id"] = data["article_id"]
+
+        if data["article_id"] and data["article_id"] not in context_ids and context_ids:
+            logger.warning(f"GPT вернул article_id не из context! Перезаписываем. data={data}")
+            data["article_id"] = context_ids[0]
+            data["fields"]["article_id"] = context_ids[0]
+
         logger.info(f"OpenAI success: stage={data.get('stage')} fields={data.get('fields')} usage={usage}")
         return data
 
