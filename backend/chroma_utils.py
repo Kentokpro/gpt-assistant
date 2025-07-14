@@ -6,6 +6,7 @@ import aiofiles
 import asyncio
 import re
 
+# Настройка логирования
 logger = logging.getLogger("leadinc-chroma")
 if not logger.hasHandlers():
     logger.setLevel(logging.INFO)
@@ -38,20 +39,16 @@ def get_collection(collection_name: str):
 
 async def search_chunks_by_embedding(
     query_emb: List[float],
-    n_results: int = 3,
+    n_results: int = 5,
     collection_name: str = "faq_leadinc",
     filters: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:
     """
-    Поиск чанков в базе по embedding с возможностью фильтрации по article_id, meta_tags, tags, title, summary.
-    :param query_emb: embedding для поиска (1 список float)
-    :param n_results: сколько результатов вернуть
-    :param collection_name: имя коллекции ChromaDB
-    :param filters: словарь для фильтрации по метаданным
-    :return: результат поиска от ChromaDB
+    Поиск чанков в ChromaDB по embedding с возвращением всех метаданных.
+    :return: Список словарей: [{article_id, title, meta_tags, tags, summary, text}, ...]
     """
-    import asyncio
     loop = asyncio.get_event_loop()
+
     def do_search():
         collection = get_collection(collection_name)
         try:
@@ -60,11 +57,24 @@ async def search_chunks_by_embedding(
                 n_results=n_results,
                 where=filters if filters else None
             )
-            logger.info(f"Поиск по базе '{collection_name}', filters={filters}, найдено: {len(result['documents'][0])}")
-            return result
+            docs = result.get("documents", [[]])[0]
+            metas = result.get("metadatas", [[]])[0]
+            enriched = []
+            for doc, meta in zip(docs, metas):
+                enriched.append({
+                    "article_id": meta.get("article_id", "unknown"),
+                    "title": meta.get("title", ""),
+                    "meta_tags": meta.get("meta_tags", ""),
+                    "tags": meta.get("tags", []),
+                    "summary": meta.get("summary", ""),
+                    "text": doc
+                })
+            logger.info(f"Поиск по базе '{collection_name}', найдено: {len(enriched)}")
+            return enriched
         except Exception as e:
             logger.error(f"Ошибка поиска в ChromaDB: {e}")
             raise
+
     return await loop.run_in_executor(None, do_search)
 
 async def filter_chunks(
@@ -76,20 +86,20 @@ async def filter_chunks(
     summary: Optional[str] = None,
     limit: int = 10
 ) -> List[Dict[str, Any]]:
+    """
+    Фильтрация чанков по метаданным.
+    :return: Список словарей: [{article_id, title, meta_tags, tags, summary, text}, ...]
+    """
     loop = asyncio.get_event_loop()
+
     def do_filter():
         collection = get_collection(collection_name)
         filters = {}
-        if article_id:
-            filters["article_id"] = article_id
-        if meta_tags:
-            filters["meta_tags"] = meta_tags
-        if tags:
-            filters["tags"] = tags
-        if title:
-            filters["title"] = title
-        if summary:
-            filters["summary"] = summary
+        if article_id: filters["article_id"] = article_id
+        if meta_tags:  filters["meta_tags"] = meta_tags
+        if tags:       filters["tags"] = tags
+        if title:      filters["title"] = title
+        if summary:    filters["summary"] = summary
         try:
             result = collection.get(
                 where=filters if filters else None,
@@ -98,20 +108,28 @@ async def filter_chunks(
             docs = []
             for doc, meta in zip(result['documents'], result['metadatas']):
                 docs.append({
-                    "text": doc,
-                    "meta": meta
+                    "article_id": meta.get("article_id", "unknown"),
+                    "title": meta.get("title", ""),
+                    "meta_tags": meta.get("meta_tags", ""),
+                    "tags": meta.get("tags", []),
+                    "summary": meta.get("summary", ""),
+                    "text": doc
                 })
-            logger.info(f"Фильтрация по базе '{collection_name}', filters={filters}, найдено: {len(docs)}")
+            logger.info(f"Фильтрация по базе '{collection_name}', найдено: {len(docs)}")
             return docs
         except Exception as e:
             logger.error(f"Ошибка фильтрации в ChromaDB: {e}")
             raise
+
     return await loop.run_in_executor(None, do_filter)
 
 async def get_full_article(
     article_id: str,
     articles_file: str = ARTICLES_FILE
 ) -> str:
+    """
+    Поиск полной статьи по article_id в markdown-файле (ручной режим, не через ChromaDB).
+    """
     try:
         async with aiofiles.open(articles_file, "r", encoding="utf-8") as f:
             content = await f.read()
@@ -120,7 +138,8 @@ async def get_full_article(
         return "Техническая ошибка: база знаний временно недоступна."
     except Exception as e:
         logger.error(f"Ошибка при чтении файла статей: {e}")
-        return "Техническая ошибка при получении статьи."    
+        return "Техническая ошибка при получении статьи."
+    
     blocks = re.split(r'\n?---\n', content)
     for block in blocks:
         if not block.strip():
@@ -131,8 +150,8 @@ async def get_full_article(
     logger.warning(f"Статья с article_id={article_id} не найдена в общем markdown-файле.")
     return "Статья не найдена."
 
-
 def list_collections():
+    """Список коллекций ChromaDB (для отладки)."""
     client = connect_to_chromadb()
     try:
         cols = client.list_collections()

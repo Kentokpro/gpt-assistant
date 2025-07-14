@@ -22,6 +22,9 @@ backup*/
 db_data/
 redis_data/
 chroma_data/
+leadinc-backend.log
+**/leadinc-backend.log
+
 
 # Виртуальные окружения
 venv/
@@ -55,3 +58,5 @@ venv/
 db_data/
 redis_data/
 chroma_data/
+udo journalctl -u gpt-backend -n 50 --no-pager
+**/udo journalctl -u gpt-backend -n 50 --no-pager

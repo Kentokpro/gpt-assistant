@@ -1,3 +1,14 @@
+"""
+Leadinc AI Backend — полный рефакторинг (2024-07)
+- Мягкая валидация через OpenAI-ассистента
+- DEV ONLY: временный вывод логина/пароля через чат
+- Управление этапами через ассистента, backend валидирует только переходы и защищает от скачков
+- Подробное логирование всех ключевых событий
+- Защита stage, нет дублей логики, правила валидации только в prompt
+- После авторизации stage не может быть <4, код и регистрацию не спрашиваем
+- Автоочистка неактуальных ключей Redis после регистрации (5 дней)
+"""
+
 import logging
 from fastapi import FastAPI, Request, Depends, HTTPException, APIRouter, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -5,6 +16,7 @@ from starlette.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from fastapi import Body
+import json
 import uuid
 import time
 import re
@@ -19,7 +31,8 @@ import redis.asyncio as aioredis
 from backend.auth import get_user_manager
 from backend.utils.passwords import generate_password
 from fastapi_users.password import PasswordHelper
-from backend.models import Session as SessionModel
+from backend.models import Session as SessionMode
+from backend.chroma_utils import filter_chunks
 
 from backend.auth import (
     fastapi_users, auth_backend, require_active_subscription, current_active_user_optional, get_jwt_strategy
@@ -34,10 +47,12 @@ from backend.schemas import UserRead, UserCreate, ChatRequest, SupportRequest
 from backend.database import SessionLocal
 from backend.chroma_utils import search_chunks_by_embedding, get_full_article
 
+# Миграция SessionLocal Depends
 async def get_db():
     async with SessionLocal() as session:
         yield session
 
+# Очистка всех временных ключей сессии
 async def clear_session_keys(sessionid: str):
     keys = [
         f"stage:{sessionid}",
@@ -52,6 +67,7 @@ async def clear_session_keys(sessionid: str):
     for key in keys:
         await redis.delete(key)
 
+# === 1. Логгер и настройки ===
 LOG_PATH = "/root/ai-assistant/backend/leadinc-backend.log"
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -67,10 +83,13 @@ logger.info("Leadinc backend стартовал успешно!")
 redis = aioredis.from_url("redis://localhost:6379", decode_responses=True)
 password_helper = PasswordHelper()
 
+# === 2. SQLAlchemy, FastAPI, Directories ===
 engine = create_async_engine(
     f"postgresql+asyncpg://{os.environ.get('POSTGRES_USER')}:{os.environ.get('POSTGRES_PASSWORD')}@{os.environ.get('POSTGRES_HOST')}:{os.environ.get('POSTGRES_PORT')}/{os.environ.get('POSTGRES_DB')}",
     echo=True
 )
+
+# === 3. Куки, сессии и утилиты ===
 
 def set_session_cookie(response: Response, session_id: str):
     response.set_cookie(
@@ -102,6 +121,8 @@ def ten_minutes_ago():
 
 def five_days():
     return 5 * 24 * 60 * 60
+
+# === 4. FastAPI App и Middleware ===
 
 app = FastAPI(
     title="Leadinc AI Assistant",
@@ -200,10 +221,12 @@ app.include_router(
 
 ai_router = APIRouter(prefix="/ai", tags=["ai"])
 
+# === 5. Ограничения и лимиты ===
 MESSAGE_LIMITS = [20, 20, 20]
 PROJECT_LIMIT_PER_DAY = 10
 USER_LIMIT = 30
 
+# === 6. Основной AI endpoint — ЛОГИКА СЦЕНАРИЯ/СТАДИЙ ===
 @ai_router.post("/chat")
 async def chat(
     payload: ChatRequest,
@@ -217,16 +240,21 @@ async def chat(
     session_id = get_or_create_session_id(request)
 
     logger.info(f"--- NEW CHAT REQ --- session={session_id} user={getattr(user, 'id', None)} content='{content[:40]}'")
+
+    # ====== ВСЯ ЛОГИКА В ОДНОМ БЛОКЕ ТРАНЗАКЦИИ ======
     async with db.begin():
         q = select(SessionModel).where(SessionModel.id == session_id)
         result = await db.execute(q)
         existing = result.scalar_one_or_none()
         if not existing:
             db.add(SessionModel(id=session_id))
-            await db.flush()
+            await db.flush()  # <<--- ДОБАВЛЕНО!
         logger.info(f"SessionModel for {session_id}: {'created' if not existing else 'exists'}")    
+        # --- 0. "Память" для AI: какие поля уже есть в Redis? ---
         phone_redis = await redis.get(f"reg_phone:{session_id}")
         email_redis = await redis.get(f"reg_email:{session_id}")
+
+        # --- 1. Stage определяем ЖЁСТКО для авторизованных ---
         if user:
             stage = 4
             logger.info(f"User is authorized. Forcing stage=4 for user_id={user.id}, session={session_id}")
@@ -241,6 +269,8 @@ async def chat(
                 stage = int(raw_stage)
                 await redis.expire(stage_key, 12*60*60)
                 logger.info(f"Stage for session {session_id}: {stage}")
+
+        # --- 2. Лимиты, спам, ограничения ---
         lim_prefix = f"{user.id}" if user else session_id
         msg_count_key = f"msg_count:{lim_prefix}:stage{stage}"
         msg_count = int(await redis.get(msg_count_key) or 0)
@@ -266,8 +296,9 @@ async def chat(
                     "reply": "Достигнут лимит сообщений. Для продолжения требуется регистрация.",
                     "meta": {"stage": 3, "reason": "guest_limit"}
                 }), session_id)
+            # Flood protection (гостям)
         if not user:
-            client_ip = request.client.host
+            client_ip = request.client.host  # <-- Получаем IP гостя
             ip_ban_key = f"guest_ip_ban:{client_ip}"
             is_banned = await redis.exists(ip_ban_key)
             if is_banned:
@@ -282,6 +313,7 @@ async def chat(
         await redis.zadd(zset_key, {str(now): now})
         guest_msgs = await redis.zcount(zset_key, ten_minutes_ago(), now)
         if guest_msgs > 20:
+            # ДОБАВЬ ЭТО:
             client_ip = request.client.host
             ip_ban_key = f"guest_ip_ban:{client_ip}"
             await redis.set(ip_ban_key, 1, ex=2*60*60)  # бан по ip на 2 часа
@@ -319,30 +351,39 @@ async def chat(
             await redis.zadd(zset_key, {str(uuid.uuid4()): now})
             msg_in_window = await redis.zcount(zset_key, ten_minutes_ago(), now)
             if msg_in_window > USER_LIMIT:
+        # СТАВИМ БЛОКИРОВКУ на 2 часа!
                 await redis.set(block_key, 1, ex=7200)
                 logger.warning(f"User msg limit EXCEEDED. user_id={user.id} session={session_id}")
                 return set_session_cookie(JSONResponse({
                     "reply": "Вы превысили лимит сообщений. Сделайте перерыв и возвращайтесь позже.",
                     "meta": {"stage": 4, "reason": "msg_limit_exceeded"}
                 }), session_id)
+
+        # ============ Блок поиска в базе знаний (RAG) ============
         context_chunks = []
         if user and stage == 4:
             try:
                 query_emb = await get_embedding(content)
                 result = await search_chunks_by_embedding(query_emb, n_results=5, collection_name="faq_leadinc")
-                docs = result.get("documents", [[]])[0]
-                metas = result.get("metadatas", [[]])[0]
-                context_chunks = [
-                    {
-                        "article_id": str(meta.get("article_id", "unknown")),
-                        "title": meta.get("title", ""),
-                        "summary": doc
-                    }
-                    for doc, meta in zip(docs, metas)
-                ]
-                logger.info(f"[RAG] Найдено {len(context_chunks)} чанков для context. IDs: {[meta.get('article_id') for meta in metas]}")
+                context_chunks = await search_chunks_by_embedding(query_emb, n_results=5, collection_name="faq_leadinc")
+                if context_chunks:
+                    log_context = [
+                        {
+                            "article_id": chunk.get("article_id"),
+                            "title": chunk.get("title"),
+                            "summary": chunk.get("summary"),
+                            "text_sample": (chunk.get("text") or "")[:100]
+                        }
+                        for chunk in context_chunks
+                    ]
+                    logger.debug(f"[DEBUG] Передаю ассистенту context_chunks: {json.dumps(log_context, ensure_ascii=False, indent=2)}")
+                else:
+                    logger.debug("[DEBUG] context_chunks пуст — ассистент не получит статьи из базы")
+                logger.info(f"[RAG] Найдено {len(context_chunks)} чанков для context. IDs: {[chunk.get('article_id') for chunk in context_chunks]}")
             except Exception as e:
                 logger.error(f"[RAG] Ошибка поиска в базе: {e}")
+
+        # --- [БЛОК] Обработка коротких подтверждений пользователя для выдачи полной статьи ---
         SHORT_CONFIRM = {
             "да", "давай", "дальше", "ещё", "еще", "продолжи", "продолжай", "погнали", "Пожалуйста", "весь текст",
             "полностью", "ок", "да, расскажи", "давай полностью", "да, интересно", "ага", "расскажи", "подробнее", "расширенно", "go on", "yes", "sure",
@@ -361,11 +402,14 @@ async def chat(
         logger.info(f"any: {any(key in user_input for key in SHORT_CONFIRM)}")
         logger.info(f"session_id: {session_id!r}")
 
+        # --- A. Всегда сначала создаем SessionModel если нет ---
         q = select(SessionModel).where(SessionModel.id == session_id)
         result = await db.execute(q)
         existing = result.scalar_one_or_none()
         if not existing:
             db.add(SessionModel(id=session_id))
+
+        # --- B. Всегда сохраняем сообщение пользователя (user) ---
         try:
             user_id = user.id if user else None
             user_msg = Message(
@@ -381,25 +425,96 @@ async def chat(
         except Exception as e:
             logger.error(f"DB error while saving user message: {str(e)}")
             print(f"Return: DB error (user message), session={session_id}")
+
+            # --- [БЛОК] "Да/Ок/Подробнее" → full_article (короткий путь, без вызова OpenAI) ---
         if pending_article_id and any(key in user_input for key in SHORT_CONFIRM):
             try:
-                article_text = await get_full_article(pending_article_id)
-                logger.debug(f"article_text type: {type(article_text)} value: {article_text}")
+                # 1. Получаем все чанки по article_id (через filter_chunks)
+                chunks = await filter_chunks(article_id=pending_article_id)
+                full_text = chunks[0]["text"] if chunks else ""
+                logger.info(f"[DEBUG full_article] pending_article_id={pending_article_id}, chunks_count={len(chunks)}")
+                context = [{
+                    "article_id": pending_article_id,
+                    "title": chunks[0]["title"] if chunks else "",
+                    "meta_tags": chunks[0]["meta_tags"] if chunks else "",
+                    "tags": chunks[0]["tags"] if chunks else [],
+                    "summary": chunks[0]["summary"] if chunks else "",
+                    "text": full_text
+                }]
+                logger.info(f"[DEBUG full_article] context (for ask_openai): {json.dumps(context, ensure_ascii=False)[:500]}")
+
+                if not full_text:
+                    logger.warning(f"Статья с article_id={pending_article_id} не найдена или пуста.")
+                    await redis.delete(f"pending_full_article:{session_id}")
+                    return set_session_cookie(JSONResponse({
+                        "reply": "Статья не найдена или временно недоступна.",
+                        "meta": {
+                            "stage": stage,
+                            "action": "full_article",
+                            "article_id": pending_article_id
+                        }
+                    }), session_id)
+
+                # 3. Удаляем pending_full_article, чтобы не было повторов
                 await redis.delete(f"pending_full_article:{session_id}")
                 logger.info(f"[DEBUG] Ключ pending_full_article:{session_id} удалён после выдачи полной статьи")
+        
+                q = (
+                    select(Message)
+                    .where(Message.session_id == session_id)
+                    .order_by(Message.created_at.desc())
+                    .limit(10)
+                )
+                result = await db.execute(q)
+                msgs_keep = result.scalars().all()[::-1]
+                messages_for_gpt = [{"role": msg.role, "content": msg.content} for msg in msgs_keep]
+
+                # 4. Готовим запрос к ассистенту для выдачи полной статьи (context уже сшит)
+                ai_response = await ask_openai(
+                    content=content,
+                    msg_type="text",
+                    stage=stage,
+                    user_authenticated=bool(user),
+                    phone=phone_redis,
+                    email=email_redis,
+                    context=context,
+                    messages=messages_for_gpt
+                )
+
+                if (
+                    len(context) == 1
+                    and context[0].get("text")
+                    and len(context[0]["text"]) > 1000
+                    and ai_response.get("action") != "full_article"
+                ):
+                    logger.warning(f"[CONTRACT ERROR] LLM не вернула action=full_article при context=full_article! Ответ: {ai_response}")
+                    # Fallback — выдаём текст напрямую, чтобы не сломать UX
+                    return set_session_cookie(JSONResponse({
+                        "reply": context[0]["text"],
+                        "meta": {
+                            "stage": stage,
+                            "action": "full_article",
+                            "article_id": pending_article_id,
+                            "contract_error": True
+                        }
+                }), session_id)
+
+                # 5. Сохраняем сообщение ассистента (выдача полной статьи)
                 try:
                     assistant_msg = Message(
                         session_id=session_id,
-                        user_id=user_id,
+                        user_id=user.id if user else None,
                         role="assistant",
                         type="text",
                         status="ok",
-                        content=article_text,
-                        meta={},
+                        content=ai_response["reply"],
+                        meta=ai_response.get("usage", {}),
                     )
                     db.add(assistant_msg)
                 except Exception as e:
                     logger.error(f"DB error while saving assistant message (full_article): {str(e)}")
+
+                # 6. Обрезаем историю до 10 последних сообщений (как обычно)
                 q = (
                     select(Message)
                     .where(Message.session_id == session_id)
@@ -423,12 +538,14 @@ async def chat(
                             Message.__table__.delete().where(Message.id.in_(ids_del))
                         )
                 await db.commit()
+        
+                # Возврат пользователю через session cookie
                 return set_session_cookie(JSONResponse({
-                    "reply": article_text,
+                    "reply": ai_response["reply"],
                     "meta": {
                         "stage": stage,
                         "action": "full_article",
-                        "article_id": pending_article_id,
+                        "article_id": pending_article_id
                     }
                 }), session_id)
             except Exception as e:
@@ -454,7 +571,7 @@ async def chat(
             .limit(10)
         )
         result = await db.execute(q)
-        msgs_keep = result.scalars().all()[::-1]
+        msgs_keep = result.scalars().all()[::-1]  # сначала старые
         q_all = (
             select(Message)
             .where(Message.session_id == session_id)
@@ -471,6 +588,7 @@ async def chat(
                 )
         messages_for_gpt = [{"role": msg.role, "content": msg.content} for msg in msgs_keep]
 
+        # --- 3. Формируем user_prompt для ассистента с памятью/контекстом ---
         phone_redis = await redis.get(f"reg_phone:{session_id}")    
         email_redis = await redis.get(f"reg_email:{session_id}")  
         ai_response = await ask_openai(  
@@ -485,6 +603,7 @@ async def chat(
         )  
         logger.info(f"ai_response: {ai_response}")
 
+        # --- Теперь сохраняем сообщение ассистента (AI) ---
         try:
             assistant_msg = Message(
                 session_id=session_id,
@@ -499,6 +618,7 @@ async def chat(
         except Exception as e:
             logger.error(f"DB error while saving assistant message (AI): {str(e)}")
 
+        # --- После этого — снова обрезаем историю (memory) до 10 ---
         q = (
             select(Message)
             .where(Message.session_id == session_id)
@@ -521,39 +641,44 @@ async def chat(
                 await db.execute(
                     Message.__table__.delete().where(Message.id.in_(ids_del))
                 )
+        # await db.commit() — не нужен, транзакция закроется автоматически
+
+        # 1. Если GPT просит "предложить полную статью" (короткий ответ, ждем подтверждения)
         action = ai_response.get("action") or ai_response.get("fields", {}).get("action")
         article_id = ai_response.get("article_id") or ai_response.get("fields", {}).get("article_id")
         if action == "offer_full_article" and article_id:
             await redis.set(f"pending_full_article:{session_id}", article_id, ex=3600)
 
-        if ai_response.get("action") == "full_article" and ai_response.get("article_id"):
-            article_id = ai_response.get("article_id")
-            try:
-                article_text = await get_full_article(article_id)
-                await redis.delete(f"pending_full_article:{session_id}")
-                logger.info(f"[DEBUG] Сохраняем pending_full_article:{session_id} = {article_id}")
-                await db.commit()
-                return set_session_cookie(JSONResponse({
-                    "reply": article_text,
-                    "meta": {
-                        "stage": stage,
-                        "action": "full_article",
-                        "article_id": article_id,
-                    }
-                }), session_id)
-            except Exception as e:
-                logger.error(f"Ошибка выдачи полной статьи по article_id={article_id}: {e}")
-                await db.rollback()
-                return set_session_cookie(JSONResponse({
-                    "reply": "Техническая ошибка. Не удалось получить полный текст.",
-                    "meta": {
-                        "stage": stage,
-                        "action": "full_article",
-                        "article_id": article_id,
-                        "error": str(e)
-                    }
-                }), session_id)
+        # 2. Если GPT сразу говорит "выдать полную статью" (например, при прямом запросе)
+#        if ai_response.get("action") == "full_article" and ai_response.get("article_id"):
+#            article_id = ai_response.get("article_id")
+#            try:
+#                article_text = await get_full_article(article_id)
+#                await redis.delete(f"pending_full_article:{session_id}")
+#                logger.info(f"[DEBUG] Сохраняем pending_full_article:{session_id} = {article_id}")
+#                await db.commit()  # Зафиксировать все перед return
+#                return set_session_cookie(JSONResponse({
+#                    "reply": article_text,
+#                    "meta": {
+#                        "stage": stage,
+#                        "action": "full_article",
+#                        "article_id": article_id,
+#                    }
+#                }), session_id)
+#            except Exception as e:
+#                logger.error(f"Ошибка выдачи полной статьи по article_id={article_id}: {e}")
+#                await db.rollback()
+#                return set_session_cookie(JSONResponse({
+#                    "reply": "Техническая ошибка. Не удалось получить полный текст.",
+#                    "meta": {
+#                        "stage": stage,
+#                        "action": "full_article",
+#                        "article_id": article_id,
+#                        "error": str(e)
+#                    }
+#                }), session_id)
 
+        # ai_response: reply, stage, fields (phone/email/niche/city), [token], [dev_creds]
         new_stage = ai_response.get('stage', stage)
         fields = ai_response.get('fields', {})
         if "action" in ai_response:
@@ -562,6 +687,7 @@ async def chat(
             fields["article_id"] = ai_response["article_id"]
         logger.info(f"AI response: stage={new_stage} fields={fields}")
 
+        # --- B. Сохраняем phone/email в Redis всегда (контекст сохраняется) ---
         updated = False
         if fields.get("phone") and fields["phone"] != phone_redis:
             await redis.set(f"reg_phone:{session_id}", fields["phone"], ex=3600)
@@ -578,6 +704,7 @@ async def chat(
         if updated:
             logger.info(f"[PATCH] reg_phone:{session_id}={phone_redis}, reg_email:{session_id}={email_redis}")
 
+        # --- A. BACKEND-ВАЛИДАЦИЯ КОДА для перехода с 1 на 2 этап ---
         if not user and stage == 1 and new_stage == 2:
             user_code = fields.get("code")
             if not user_code:
@@ -597,6 +724,7 @@ async def chat(
             await redis.delete(code_key)
             logger.info(f"Код принят: {user_code}, session={session_id}")
 
+        # --- C. Жёсткая защита stage для авторизованных ---
         allow = False
         if user:
             if new_stage == 4:
@@ -614,10 +742,14 @@ async def chat(
                     "reply": "Ошибка этапа! Давай попробуем ещё раз по шагам.",
                     "meta": {"stage": stage, "reason": "stage_jump"}
                 }), session_id)
+
+        # --- Фиксируем stage и поля в Redis ---
         stage_key = f"stage:{session_id}"
         if allow:
             await redis.set(stage_key, new_stage, ex=12*60*60)
             logger.info(f"Stage updated: {stage} → {new_stage} session={session_id}")
+
+        # --- Регистрируем пользователя ---
         if not user and stage == 3 and new_stage == 4 and phone_final and email_final:
             try:
                 q = select(User).where(
@@ -665,6 +797,7 @@ async def chat(
                 logger.info(f"Новый пользователь зарегистрирован: email={email_final}, phone={phone_final}")
                 print(f"[DEBUG] Generated password for {email_final}: {password}")
                 logger.info(f"Final AI reply: {ai_response['reply']}")
+                # Очищаем временные ключи (и autoочистка на 5 дней)
                 await redis.delete(f"stage:{session_id}")
                 await redis.delete(f"reg_phone:{session_id}")
                 await redis.delete(f"reg_email:{session_id}")
@@ -682,8 +815,8 @@ async def chat(
                         "usage": ai_response.get("usage", {}),
                         "fields": fields,
                         "token": token,
-                        "login": email_final,    
-                        "password": password     
+                        "login": email_final,    # или phone_final
+                        "password": password     # ТОЛЬКО ДЛЯ DEV!
                     }
                 }
                 response = JSONResponse(response_data)
@@ -695,6 +828,7 @@ async def chat(
                     secure=not DEBUG,
                     samesite="Strict" if not DEBUG else "Lax"
                 )
+                # Кука с JWT-токеном (имя куки = как в fastapi_users.config, обычно "fastapiusersauth")
                 response.set_cookie(
                     key="fastapiusersauth",
                     value=token,
@@ -713,6 +847,7 @@ async def chat(
                     "meta": {"stage": 3, "reason": "register_error"}
             }), session_id)
 
+    # --- Сбор финального ответа ---
     reply = ai_response.get("reply", "")
     if not isinstance(reply, str):
         reply = json.dumps(reply, ensure_ascii=False)
@@ -733,18 +868,20 @@ async def chat(
     await db.commit()
     return set_session_cookie(JSONResponse(response_data), session_id)
 
-
 @ai_router.post("/rag")
 async def rag_search(
     payload: ChatRequest,
     request: Request,
     user: User = Depends(current_active_user_optional),
 ):
+    # 1. Проверяем авторизацию
     if not user:
         return JSONResponse(
             {"reply": "Поиск по базе Leadinc доступен только авторизованным пользователям.", "meta": {"reason": "unauthorized"}},
             status_code=403
         )
+
+    # 2. Проверяем этап авторизации (stage 4)
     session_id = request.cookies.get("sessionid")
     stage_key = f"stage:{session_id}"
     stage = None
@@ -760,6 +897,8 @@ async def rag_search(
             {"reply": "Доступ к базе открыт только после завершения регистрации и авторизации.", "meta": {"reason": "not_authorized_stage"}},
             status_code=403
         )
+
+    # 3. Получаем embedding запроса
     try:
         query_emb = await get_embedding(payload.content)
     except Exception as e:
@@ -768,6 +907,8 @@ async def rag_search(
             {"reply": "Ошибка обработки embedding. Попробуйте позже.", "meta": {"reason": "embedding_error"}},
             status_code=500
         )
+
+    # 4. Поиск по ChromaDB
     try:
         result = await search_chunks_by_embedding(
             query_emb=query_emb,
@@ -789,6 +930,8 @@ async def rag_search(
             {"reply": "По вашему запросу не найдено релевантной информации в базе Leadinc.", "meta": {"chunks": [], "found": 0}},
             status_code=200
         )
+
+    # Склеиваем результат для ассистента (можешь доработать, если нужна отдельная логика)
     joined_chunks = "\n\n".join(found_texts)
     meta_info = [meta.get("title", "") for meta in found_metas]
 
@@ -822,18 +965,19 @@ async def logout(request: Request, response: Response):
         key="sessionid",
         path="/",
         httponly=True,
-        secure=True,      
-        samesite="lax"    
+        secure=True,      # Только если у тебя прод/https!
+        samesite="lax"    # Или "strict", если выставляешь так при login!
     )
     response.delete_cookie(
         key="fastapiusersauth",
         path="/",
         httponly=True,
-        secure=True,      
-        samesite="strict" 
+        secure=True,      # Только если у тебя прод/https!
+        samesite="strict" # Или "lax" — смотри как при установке!
     )
     return response
 
+# --- Поддержка/почта ---
 @ai_router.post("/support")
 async def support_request(
     payload: SupportRequest,
@@ -847,6 +991,7 @@ async def support_request(
     )
     return {"status": "sent"}
 
+# --- Аналитика/метрики ---
 @app.middleware("http")
 async def add_analytics_headers(request: Request, call_next):
     response = await call_next(request)
@@ -855,3 +1000,4 @@ async def add_analytics_headers(request: Request, call_next):
     return response
 
 app.include_router(ai_router)
+
