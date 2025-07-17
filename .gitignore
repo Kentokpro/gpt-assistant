@@ -39,16 +39,23 @@ __pycache__/
 .vscode/
 
 # Медиа/временные файлы
+backend/media/
 media/
 uploads/
 tmp/
 *.tmp
 static/
+*.mp3
+*.ogg
+*.wav
+*.m4a
+*.aac
 
 alembic.ini
 *.env
 .env.*
 .env
+
 
 # Virtualenvs
 venv/
@@ -60,3 +67,63 @@ redis_data/
 chroma_data/
 udo journalctl -u gpt-backend -n 50 --no-pager
 **/udo journalctl -u gpt-backend -n 50 --no-pager
+
+# Бэкапы и дампы
+backup*/
+db_data_backup_*/
+*.bak
+*.sql
+*.dump
+*.tar
+*.tar.gz
+*.zip
+*.gz
+
+# === Voice stack (ElevenLabs / Whisper) & media ===============
+
+# Временные аудиофайлы (mp3/ogg/wav) и хранилище медиа
+backend/media/
+*.mp3
+*.ogg
+*.wav
+
+# Временные чанки, датасеты, обучающие WAV-файлы для клонов голоса
+dataset_raw/
+dataset_clean/
+*.flac
+
+# Логи Celery, ffmpeg, worker-output
+celery*.log
+ffmpeg*.log
+worker*.log
+
+# PID-файлы и run-директория Celery / Flower
+celerybeat.pid
+celerybeat-schedule
+run/
+
+# Служебные файлы Flower (монитор Celery)
+flower/
+
+# === Скрипты и резервные копии =================================
+
+# bash-скрипты
+scripts/cleanup_audio.sh
+
+# Бэкапы / архивы
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.bak
+*.backup
+
+# === Секреты и ключи (поддержка TTS/STT) =======================
+
+# Ключи ElevenLabs / OpenAI / Vault
+*.key*
+*.pem*
+*.crt*
+*token*
+*secret*
+.env*

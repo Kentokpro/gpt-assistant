@@ -31,7 +31,7 @@ import redis.asyncio as aioredis
 from backend.auth import get_user_manager
 from backend.utils.passwords import generate_password
 from fastapi_users.password import PasswordHelper
-from backend.models import Session as SessionMode
+from backend.models import Session as SessionModel
 from backend.chroma_utils import filter_chunks
 
 from backend.auth import (
