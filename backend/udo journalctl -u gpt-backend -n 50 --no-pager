@@ -1,6 +1,0 @@
-● gpt-backend.service - FastAPI backend via uvicorn
-     Loaded: loaded (/etc/systemd/system/gpt-backend.service; disabled; vendor preset: enabled)
-     Active: activating (auto-restart) (Result: exit-code) since Thu 2025-05-29 18:43:46 MSK; 2s ago
-    Process: 202676 ExecStart=/root/gpt-assistant/backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8008 [0;1;31m(code=exited, status=1/FAILURE)[0m
-   Main PID: 202676 (code=exited, status=1/FAILURE)
-        CPU: 594ms

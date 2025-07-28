@@ -22,8 +22,29 @@ logger = logging.getLogger("leadinc-backend")
 
 @signals.setup_logging.connect
 def setup_celery_logging(**kwargs):
-    # Перенаправляем логи Celery в наш логгер (leadinc-backend.log)
-    pass  # уже настроено в logging.basicConfig приложения
+    from logging.config import dictConfig
+    dictConfig({
+        "version": 1,
+        "handlers": {
+            "file": {
+                "level": "INFO",
+                "class": "logging.FileHandler",
+                "filename": "/root/ai-assistant/backend/celery.log",
+                "encoding": "utf-8",
+            },
+            "console": {
+                "level": "INFO",
+                "class": "logging.StreamHandler",
+            },
+        },
+        "loggers": {
+            "leadinc-backend": {
+                "handlers": ["file", "console"],
+                "level": "INFO",
+                "propagate": False,
+            },
+        },
+    })
 
 @signals.worker_ready.connect
 def on_worker_ready(**kwargs):
@@ -40,14 +61,6 @@ def on_task_postrun(task_id=None, task=None, retval=None, state=None, **kwargs):
 @signals.task_failure.connect
 def on_task_failure(task_id=None, exception=None, args=None, kwargs=None, traceback=None, einfo=None, **other):
     logger.error(f"[Celery] Task failed: {task_id} | error={exception}")
-
-@signals.task_soft_time_limit.connect
-def on_task_soft_time_limit(task_id=None, task=None, **kwargs):
-    logger.warning(f"[Celery] Task soft_time_limit exceeded: {task.name} | id={task_id}")
-
-@signals.task_time_limit.connect
-def on_task_time_limit(task_id=None, task=None, **kwargs):
-    logger.error(f"[Celery] Task HARD time_limit exceeded: {task.name} | id={task_id}")
 
 if __name__ == "__main__":
     # Пример запуска worker через команду:

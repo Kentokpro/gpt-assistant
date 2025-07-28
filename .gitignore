@@ -4,6 +4,8 @@
 .env.docker
 backend/.env
 backend/.env.backend
+*password*
+*key*
 
 # Данные и дампы
 *.log
@@ -24,7 +26,8 @@ redis_data/
 chroma_data/
 leadinc-backend.log
 **/leadinc-backend.log
-
+*.save
+*.save.*
 
 # Виртуальные окружения
 venv/
@@ -37,19 +40,32 @@ __pycache__/
 # IDE и редакторы
 .idea/
 .vscode/
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
+
 
 # Медиа/временные файлы
-backend/media/
+/backend/media/
+/backend/media/audio/
+/backend/scripts/*.log
+/backend/scripts/*.bak
+/backend/scripts/*.tmp
+/backend/scripts/*.out
+/backend/celery.log
+/backend/leadinc-backend.log
 media/
 uploads/
 tmp/
 *.tmp
-static/
 *.mp3
 *.ogg
 *.wav
 *.m4a
 *.aac
+*.out
 
 alembic.ini
 *.env
@@ -127,3 +143,4 @@ scripts/cleanup_audio.sh
 *token*
 *secret*
 .env*
+

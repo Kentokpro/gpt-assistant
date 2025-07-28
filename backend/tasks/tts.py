@@ -13,155 +13,257 @@ TTS-задача для Celery:
 - backend/utils/audio_utils.py (ffmpeg, валидация)
 - backend/models.py (Message, ErrorLog)
 - celeryconfig.py
+
+"""
+"""
+backend/tasks/tts.py
+
+Celery-задача для генерации голосового ответа (TTS) через ElevenLabs:
+- Получает текст, voice_id, user_id, session_id, формат (mp3/ogg)
+- Валидирует текст, вызывает generate_tts (асинхронно)
+- Сохраняет аудиофайл, транскрипцию, метаданные
+- Логирует ошибки через ErrorLog и log_error_to_db
+- SLA-контроль, возврат результата (status, audio_url, transcript, meta)
 """
 
 import os
-import uuid
 import time
 import logging
+import asyncio
 
-from celery import Celery
-from backend.celeryconfig import celery_app
-from backend.utils.tts_utils import tts_generate_elevenlabs
-from backend.utils.audio_utils import (
-    convert_mp3_to_ogg, 
-    delete_file, 
-    validate_audio_file
-)
-from backend.models import ErrorLog, Message
-from backend.config import MEDIA_DIR
+from celery import Task
+
+from backend.celery_worker import celery_app
+from backend.utils.tts_utils import generate_tts
+from backend.models import Message, AudioEventLog
+from backend.utils.audio_utils import MEDIA_AUDIO_DIR
+from backend.utils.error_log_utils import log_error_to_db
+from backend.database import SessionLocalSync
+from backend.utils.audio_constants import TTS_SLA_LIMIT, TTS_SOFT_TIME_LIMIT, TTS_HARD_TIME_LIMIT
 
 logger = logging.getLogger("leadinc-backend")
 
-TTS_SLA_LIMIT = 45  # seconds
-TTS_SOFT_TIME_LIMIT = 90
-TTS_HARD_TIME_LIMIT = 120
-
-@celery_app.task(bind=True, soft_time_limit=TTS_SOFT_TIME_LIMIT, time_limit=TTS_HARD_TIME_LIMIT)
-def tts_task(self, text: str, voice_id: str, user_id: str = None, session_id: str = None, output_format: str = "mp3"):
+def _make_result(status, audio_url, text_transcript, started_at, meta):
     """
-    Задача TTS:
-    - Генерирует аудио по тексту через ElevenLabs
-    - Сохраняет mp3/ogg, возвращает ссылку, логи, SLA
-
-    Args:
-        text (str): исходный текст для синтеза
-        voice_id (str): идентификатор кастомного голоса
-        user_id (str): id пользователя
-        session_id (str): id сессии
-        output_format (str): "mp3" (web) или "ogg" (Telegram)
-
-    Returns:
-        dict: {
-            "status": "ok"/"failed",
-            "audio_url": str,
-            "text_transcript": str,
-            "meta": {...}
-        }
+    Вспомогательная функция для финального формирования результата TTS.
+    - Гарантирует только dict с сериализуемыми данными.
     """
-
-    task_id = str(uuid.uuid4())
-    t_start = time.time()
-    status = "pending"
-    audio_url = ""
-    error_details = {}
-    text_transcript = text
-
-    logger.info(f"[TTS] [{task_id}] Старт синтеза: len={len(text)}, voice_id={voice_id}, user_id={user_id}, session_id={session_id}")
-
-    try:
-        # 1. Валидация текста (только не пустой)
-        if not isinstance(text, str) or not text.strip():
-            status = "failed"
-            error_details = {"reason": "empty_text", "len": len(text) if isinstance(text, str) else None}
-            logger.warning(f"[TTS] [{task_id}] Текст невалиден — пустой")
-            _log_error("TTS invalid text", user_id, session_id, error_details)
-            return _make_result(status, audio_url, text_transcript, t_start, error_details)
-
-        # 2. Генерация аудио через ElevenLabs
-        mp3_path, tts_meta = tts_generate_elevenlabs(text, voice_id)
-        if not mp3_path or not os.path.exists(mp3_path):
-            status = "failed"
-            error_details = {"reason": "TTS generate failed", "meta": tts_meta}
-            logger.error(f"[TTS] [{task_id}] Ошибка генерации ElevenLabs")
-            _log_error("TTS failed", user_id, session_id, error_details)
-            return _make_result(status, audio_url, text_transcript, t_start, error_details)
-
-        # 3. По необходимости конвертировать mp3→ogg (для Telegram)
-        audio_path = mp3_path
-        if output_format == "ogg":
-            ogg_path = convert_mp3_to_ogg(mp3_path)
-            if ogg_path and os.path.exists(ogg_path):
-                delete_file(mp3_path)
-                audio_path = ogg_path
-                logger.info(f"[TTS] [{task_id}] MP3→OGG: {ogg_path}")
-            else:
-                logger.warning(f"[TTS] [{task_id}] Не удалось сконвертировать в ogg")
-                # fallback — оставляем mp3
-
-        # 4. Валидация файла (длительность, размер)
-        valid, reason, duration = validate_audio_file(audio_path)
-        if not valid:
-            status = "failed"
-            error_details = {"reason": reason, "duration": duration}
-            logger.warning(f"[TTS] [{task_id}] Аудиофайл невалиден: {reason}")
-            delete_file(audio_path)
-            _log_error("TTS invalid audio", user_id, session_id, error_details)
-            return _make_result(status, audio_url, text_transcript, t_start, error_details)
-
-        # 5. Формируем URL для медиа (frontend получает только путь, не download link)
-        rel_path = os.path.relpath(audio_path, MEDIA_DIR)
-        audio_url = f"/media/{rel_path}"
-
-        # 6. Сохраняем сообщение типа "voice" в базе
-        Message.save_voice_message(
-            user_id=user_id,
-            session_id=session_id,
-            content=audio_url,
-            meta={"tts_meta": tts_meta, "elapsed": tts_meta.get("elapsed"), "voice_id": voice_id, "format": output_format},
-        )
-
-        # 7. SLA: логируем превышение лимита
-        elapsed = time.time() - t_start
-        if elapsed > TTS_SLA_LIMIT:
-            logger.error(f"[TTS][SLA_TIMEOUT] [{task_id}] Превышено время обработки: {elapsed:.2f}s")
-            _log_error("SLA timeout (TTS)", user_id, session_id, {
-                "elapsed": elapsed, "task_id": task_id, "audio_path": audio_path
-            })
-
-        # 8. Возврат результата
-        return _make_result("ok", audio_url, text_transcript, t_start, {"tts_meta": tts_meta, "voice_id": voice_id})
-
-    except Exception as e:
-        status = "failed"
-        error_details = {"exception": str(e)}
-        logger.error(f"[TTS][ERROR] [{task_id}] {e}")
-        _log_error("TTS failed", user_id, session_id, error_details)
-        return _make_result(status, audio_url, text_transcript, t_start, error_details)
-
-
-# ============ Хелперы ============
-
-def _log_error(error: str, user_id, session_id, details):
-    try:
-        ErrorLog.save(
-            error=error,
-            user_id=user_id,
-            details=details,
-            session_id=session_id
-        )
-    except Exception as e:
-        logger.error(f"[TTS][ErrorLog FAIL] {e}")
-
-def _make_result(status, audio_url, text_transcript, t_start, meta):
-    elapsed = time.time() - t_start
-    return {
+    elapsed = time.monotonic() - started_at
+    if meta is not None and isinstance(meta, dict):
+        meta["final_elapsed_time"] = elapsed
+        if isinstance(audio_url, str):
+            meta["audio_url"] = audio_url
+    result = {
         "status": status,
-        "audio_url": audio_url,
-        "text_transcript": text_transcript,
-        "meta": {
-            "elapsed": elapsed,
-            **(meta or {})
+        "audio_url": audio_url if isinstance(audio_url, str) or audio_url is None else str(audio_url),
+        "text_transcript": text_transcript if isinstance(text_transcript, str) else str(text_transcript),
+        "meta": meta if isinstance(meta, dict) else {},
+    }
+    # Дополнительная проверка сериализации
+    try:
+        import json
+        json.dumps(result)
+    except Exception as e:
+        logger.error(f"[TTS][ERROR] Result not serializable: {e}, result={result}")
+        result = {
+            "status": "failed",
+            "audio_url": None,
+            "text_transcript": text_transcript if isinstance(text_transcript, str) else "",
+            "meta": {"error": "Result serialization failed", "exception": str(e)}
         }
+    return result
+
+@celery_app.task(bind=True, name="tts.tts_task", queue="audio", soft_time_limit=TTS_SOFT_TIME_LIMIT, time_limit=TTS_HARD_TIME_LIMIT)
+def tts_task(self, text: str, voice_id: str = None, user_id: str = None, session_id: str = None, output_format: str = "mp3"):
+    """
+    Celery-задача для генерации речи через ElevenLabs TTS.
+    Всегда возвращает только dict, пригодный для json-сериализации.
+    """
+    task_id = str(self.request.id)
+    started_at = time.monotonic()
+    status = "pending"
+    audio_url = None
+    text_transcript = text.strip() if isinstance(text, str) else ""
+    meta = {
+        "task_id": task_id,
+        "voice_id": voice_id,
+        "user_id": user_id,
+        "session_id": session_id,
+        "output_format": output_format,
+        "sla_slow": False
     }
 
+    logger.info(f"[TTS TASK] Start: text='{text_transcript[:50]}', voice_id='{voice_id}', user_id='{user_id}', session_id='{session_id}', output_format='{output_format}'")
+
+    # Проверка валидности текста
+    if not isinstance(text, str) or not text.strip():
+        logger.warning(f"[TTS TASK] Empty or invalid text, skipping TTS")
+        status = "failed"
+        meta["error"] = "Empty or invalid text"
+        result = _make_result(status, None, text_transcript, started_at, meta)
+        return result
+
+    # Проверка и логирование ключей окружения
+    import os
+    env_api_key = os.environ.get("ELEVENLABS_API_KEY")
+    env_voice_id = os.environ.get("ELEVENLABS_VOICE_ID")
+    env_fallback_voice_id = os.environ.get("ELEVENLABS_FALLBACK_VOICE_ID")
+    logger.info(f"[TTS TASK][ENV] API_KEY={'YES' if env_api_key else 'NO'}, VOICE_ID={env_voice_id}, FALLBACK={env_fallback_voice_id}")
+
+    # Основной асинхронный вызов generate_tts (через event loop)
+    try:
+        # Внимание: запуск отдельного event loop для Celery Sync задачи!
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            tts_result = loop.run_until_complete(
+                generate_tts(
+                    text=text_transcript,
+                    voice_id=voice_id,
+                    fallback=True,
+                    audio_format=output_format,
+                    telegram=(output_format == "ogg"),
+                    user_id=user_id,
+                    meta=meta
+                )
+            )
+        finally:
+            loop.close()
+
+        logger.info(f"[TTS TASK] generate_tts result: {tts_result}")
+
+        # Обработка результата — только dict!
+        if tts_result is None:
+            logger.error(f"[TTS TASK][ERROR] generate_tts вернул None!")
+            status = "failed"
+            meta["error"] = "generate_tts returned None"
+            result = _make_result(status, None, text_transcript, started_at, meta)
+            return result
+
+        if not isinstance(tts_result, dict):
+            logger.error(f"[TTS TASK][ERROR] generate_tts вернул НЕ dict: {tts_result}")
+            status = "failed"
+            meta["error"] = "generate_tts did not return dict"
+            result = _make_result(status, None, text_transcript, started_at, meta)
+            return result
+
+        # Фолбэк на текст — если нет аудио (например, ошибка TTS)
+        if tts_result.get("reply_type") == "text" or not tts_result.get("audio_url"):
+            status = "failed"
+            meta.update(tts_result.get("meta", {}))
+            meta["error"] = meta.get("error", "TTS failed or fallback")
+            log_error_to_db(user_id, "TTS failed", {"task_id": task_id, **meta})
+            # Логируем событие AudioEventLog
+            try:
+                with SessionLocalSync() as db:
+                    audio_event = AudioEventLog(
+                        user_id=user_id,
+                        session_id=session_id,
+                        message_id=None,
+                        event_type="audio_failed",
+                        file_path=None,
+                        status="failed",
+                        details={
+                            "tts_meta": meta,
+                            "task_id": task_id,
+                            "format": output_format,
+                            "error": meta.get("error", "TTS failed or fallback"),
+                            "elapsed": time.monotonic() - started_at
+                        }
+                    )
+                    db.add(audio_event)
+                    db.commit()
+            except Exception as db_e:
+                logger.error(f"[TTS TASK][DB ERROR] Failed to log AudioEventLog: {db_e}")
+            result = _make_result(status, None, text_transcript, started_at, meta)
+            return result
+
+        # Всё ОК — аудиофайл успешно сгенерирован
+        audio_url = tts_result.get("audio_url")
+        if isinstance(audio_url, bytes):
+            audio_url = audio_url.decode("utf-8")
+        elif not isinstance(audio_url, str):
+            audio_url = str(audio_url)
+
+        # Логируем AudioEventLog (успех)
+        try:
+            msg = Message.save_voice_message_sync(
+                user_id=user_id,
+                session_id=session_id,
+                content=audio_url,
+                meta={
+                    "tts_meta": tts_result.get("meta", {}),
+                    "format": output_format,
+                    "task_id": task_id,
+                    "transcript": text_transcript
+                }
+            )
+            with SessionLocalSync() as db:
+                audio_event = AudioEventLog(
+                    user_id=user_id,
+                    session_id=session_id,
+                    message_id=msg.id if msg else None,
+                    event_type="audio_created",
+                    file_path=audio_url,
+                    status="ok",
+                    details={
+                        "tts_meta": tts_result.get("meta", {}),
+                        "task_id": task_id,
+                        "format": output_format,
+                        "elapsed": time.monotonic() - started_at
+                    }
+                )
+                db.add(audio_event)
+                db.commit()
+        except Exception as db_e:
+            logger.error(f"[TTS TASK][DB ERROR] Failed to log success AudioEventLog: {db_e}")
+
+        # Проверка времени выполнения (SLA)
+        elapsed = time.monotonic() - started_at
+        if elapsed > TTS_SLA_LIMIT:
+            meta["sla_slow"] = True
+            log_error_to_db(user_id, "TTS SLA timeout", {
+                "task_id": task_id, "elapsed": elapsed, "audio_url": audio_url
+            })
+
+        status = "ok"
+        meta.update({
+            "elapsed_time": elapsed,
+            "audio_url": audio_url,
+            "format": output_format
+        })
+
+        logger.info(f"[TTS] [{task_id}] Успешно: audio_url={audio_url}, elapsed={elapsed:.2f}s, user={user_id}")
+
+        result = _make_result(status, audio_url, text_transcript, started_at, meta)
+        return result
+
+    except Exception as e:
+        # Глобальная обработка всех ошибок
+        status = "failed"
+        meta["error"] = str(e)
+        logger.error(f"[TTS][ERROR] [{task_id}] {e}", exc_info=True)
+        log_error_to_db(user_id, "TTS error", {"task_id": task_id, "error": str(e)})
+        try:
+            with SessionLocalSync() as db:
+                audio_event = AudioEventLog(
+                    user_id=user_id,
+                    session_id=session_id,
+                    message_id=None,
+                    event_type="audio_failed",
+                    file_path=None,
+                    status="failed",
+                    details={
+                        "task_id": task_id,
+                        "format": output_format,
+                        "error": str(e),
+                        "elapsed": time.monotonic() - started_at
+                    }
+                )
+                db.add(audio_event)
+                db.commit()
+        except Exception as db_e:
+            logger.error(f"[TTS][ERROR] Failed to log error AudioEventLog: {db_e}")
+        result = _make_result(status, None, text_transcript, started_at, meta)
+        return result
+# Конец функции tts_task

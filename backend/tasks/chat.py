@@ -1,56 +1,51 @@
 """
-chat.py — Celery-задача для text/chat очереди
-— Принимает текстовый запрос, вызывает OpenAI (через openai_utils.ask_openai)
-— Сохраняет ответ в Message (type='text')
-— SLA: логирует время обработки, ошибки — в ErrorLog
-— Требует:
-    - openai_utils.py
-    - models.py (User, Message, ErrorLog, Session)
-    - celeryconfig.py
-    - celery_worker.py (инициализация celery)
-    - .env.backend с OPENAI_API_KEY
-    - Логгер leadinc-backend
+backend/tasks/chat.py
+
+Celery-задача для text/chat очереди:
+— Получает текстовый запрос, вызывает OpenAI (через openai_utils.ask_openai)
+— Сохраняет оба сообщения (user, assistant) в Message
+— SLA: логирует время, все ошибки через ErrorLog
+"""
+"""
+Основная задача text/chat:
+— Получает chat_payload (dict: content, user_id, session_id, meta и пр.)
+— Вызывает ask_openai (async), сохраняет оба сообщения, логирует SLA, ошибки
+— Все ошибки через log_error_to_db
 """
 
 import logging
 import time
 import uuid
 from datetime import datetime
+import asyncio
 
 from backend.openai_utils import ask_openai
 from backend.database import SessionLocal
-from backend.models import User, Message, Session, ErrorLog
-from backend.config import LOG_LEVEL
+from backend.models import User, Message, Session
+from backend.utils.error_log_utils import log_error_to_db
+from backend.celery_worker import celery_app
+from backend.utils.audio_constants import TTS_HARD_TIME_LIMIT, STT_HARD_TIME_LIMIT
 
 logger = logging.getLogger("leadinc-backend")
-logger.setLevel(LOG_LEVEL)
 
-# ——— Celery импортируется из celery_worker.py (важно: не делать новый celery instance!)
-from backend.celery_worker import celery_app
+# ——— Лимит времени задачи (максимум из TTS/STT, если понадобится)
+HARD_TIME_LIMIT = max(TTS_HARD_TIME_LIMIT, STT_HARD_TIME_LIMIT)  # 60
 
-@celery_app.task(bind=True, name="chat.process_text", queue="text", soft_time_limit=45, time_limit=60)
+@celery_app.task(bind=True, name="chat.process_text", queue="text", soft_time_limit=HARD_TIME_LIMIT, time_limit=HARD_TIME_LIMIT+10)
 def process_text(self, chat_payload: dict):
-    """
-    Основная задача text/chat: 
-    — Получает chat_payload (dict: content, user_id, session_id, meta и пр)
-    — Вызывает ask_openai, сохраняет ответ, логирует SLA, ошибки
-    — ErrorLog при ошибках, SLA в meta
-    """
     task_id = str(self.request.id)
     started_at = time.monotonic()
     utc_started = datetime.utcnow()
-    logger.info(f"[chat] New chat-task {task_id}, user={chat_payload.get('user_id')}, session={chat_payload.get('session_id')}")
-    try:
-        # 1. Сохраняем user/message/session
-        with SessionLocal() as db:
-            user_id = chat_payload.get("user_id")
-            session_id = chat_payload.get("session_id")
-            user = db.query(User).filter_by(id=user_id).first() if user_id else None
-            session = db.query(Session).filter_by(id=session_id).first() if session_id else None
+    user_id = chat_payload.get("user_id")
+    session_id = chat_payload.get("session_id")
 
-            # 2. Сохраняем входящее сообщение
+    logger.info(f"[chat] New chat-task {task_id}, user={user_id}, session={session_id}")
+
+    try:
+        with SessionLocal() as db:
+            # — 1. Сохраняем входящее сообщение пользователя
             message = Message(
-                id=str(uuid.uuid4()),
+                id=uuid.uuid4(),
                 session_id=session_id,
                 user_id=user_id,
                 role="user",
@@ -63,26 +58,32 @@ def process_text(self, chat_payload: dict):
             db.add(message)
             db.commit()
 
-            # 3. Вызов ask_openai (ответ ассистента)
-            ai_response = ask_openai(
-                content=chat_payload.get("content"),
-                msg_type="text",
-                stage=chat_payload.get("stage", 4),
-                user_authenticated=True if user_id else False,
-                phone=chat_payload.get("phone"),
-                email=chat_payload.get("email"),
-                context=chat_payload.get("context"),
-                messages=chat_payload.get("messages"),
-            )
-            # (sync — для Celery 5.x, если будет async нужен run_until_complete)
+            # — 2. Вызов OpenAI (ответ ассистента) через run_until_complete
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                ai_response = loop.run_until_complete(
+                    ask_openai(
+                        content=chat_payload.get("content"),
+                        msg_type="text",
+                        stage=chat_payload.get("stage", 4),
+                        user_authenticated=bool(user_id),
+                        phone=chat_payload.get("phone"),
+                        email=chat_payload.get("email"),
+                        context=chat_payload.get("context"),
+                        messages=chat_payload.get("messages"),
+                    )
+                )
+            finally:
+                loop.close()
 
             elapsed = time.monotonic() - started_at
             utc_completed = datetime.utcnow()
             logger.info(f"[chat] Chat-task {task_id} complete, elapsed={elapsed:.2f}s, user={user_id}")
 
-            # 4. Сохраняем ответ ассистента
+            # — 3. Сохраняем ответ ассистента
             assistant_msg = Message(
-                id=str(uuid.uuid4()),
+                id=uuid.uuid4(),
                 session_id=session_id,
                 user_id=user_id,
                 role="assistant",
@@ -99,7 +100,6 @@ def process_text(self, chat_payload: dict):
             db.add(assistant_msg)
             db.commit()
 
-            # 5. Возврат результата
             return {
                 "task_id": task_id,
                 "status": "done",
@@ -113,22 +113,17 @@ def process_text(self, chat_payload: dict):
     except Exception as e:
         elapsed = time.monotonic() - started_at
         logger.error(f"[chat] Error in chat-task {task_id}: {e}")
-        # ErrorLog пишем в БД
-        with SessionLocal() as db:
-            errorlog = ErrorLog(
-                id=str(uuid.uuid4()),
-                user_id=chat_payload.get("user_id"),
-                error="chat_failed",
-                details={
-                    "task_id": task_id,
-                    "error": str(e),
-                    "elapsed": elapsed,
-                    "stage": chat_payload.get("stage"),
-                },
-                created_at=datetime.utcnow(),
-            )
-            db.add(errorlog)
-            db.commit()
+        # Централизованно логируем ошибку (ErrorLog)
+        log_error_to_db(
+            user_id=user_id,
+            error="chat_failed",
+            details={
+                "task_id": task_id,
+                "error": str(e),
+                "elapsed": elapsed,
+                "stage": chat_payload.get("stage"),
+            }
+        )
         return {
             "task_id": task_id,
             "status": "failed",

@@ -1,41 +1,38 @@
 """
-Leadinc: Pydantic-схемы для всех API (text/voice), поддержки мультимодального чата, ErrorLog, SLA, транскрипций.
-
+Leadinc: Pydantic-схемы для всех API (text/voice), ErrorLog, SLA, транскрипций.
+- Строго для Pydantic v2.11.7 (FastAPI 0.110+).
 - Содержит расширенные схемы для чата (text/voice), логики аудиоответа, статуса Celery-задач и ошибок.
-- Все ключевые поля и примеры структурированы по best practice, naming и архитектуре проекта.
 """
 
 from typing import Any, Optional, List, Dict, Literal, Union
-from pydantic import BaseModel, EmailStr, UUID4, Field
+from pydantic import BaseModel, EmailStr, UUID4, Field, ConfigDict
 from datetime import datetime
 from fastapi_users.schemas import BaseUser, BaseUserCreate, BaseUserUpdate
+from uuid import UUID
+from pydantic import BaseModel, EmailStr, ConfigDict
 
-# === 1. Текстовые чаты (стандартные) ===
+# === 1. Текстовые и голосовые чаты (универсальный запрос) ===
 class ChatRequest(BaseModel):
-    """
-    Универсальная схема для любых запросов: текстовых и голосовых.
-    - type: указывает, что именно отправляет пользователь ("text" или "voice")
-    - answer_format: указывает, в каком формате хочет получить ответ ("text" или "voice")
-    - content: содержимое запроса, если type="text" (если voice — файл через multipart)
-    """
     content: Optional[str] = None
     type: Literal["text", "voice"] = "text"
     answer_format: Literal["text", "voice"] = "text"
+    tts_format: Optional[Literal["mp3", "m4a", "ogg", "webm"]] = "mp3"
 
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "content": "Расскажи как устроен Leadinc.",
                 "type": "text",
-                "answer_format": "voice"  # Получить ответ голосом
+                "answer_format": "voice"
             }
         }
+    )
 
-# === 2. Статус Celery задачи (poll/результат) ===
+# === 2. Статус Celery задачи ===
 class TaskStatus(BaseModel):
     task_id: str
     status: Literal["pending", "processing", "done", "failed", "timeout"]
-    elapsed_time: Optional[float] = None  # секунд
+    elapsed_time: Optional[float] = None
     reply_type: Optional[Literal["text", "voice"]] = None
     audio_url: Optional[str] = None
     text_transcript: Optional[str] = None
@@ -43,8 +40,8 @@ class TaskStatus(BaseModel):
     error: Optional[str] = None
     meta: Optional[Dict[str, Any]] = None
 
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "task_id": "7e5c6ed4-bd32-42d7-bba5-418f0b1e3fc0",
                 "status": "done",
@@ -61,16 +58,18 @@ class TaskStatus(BaseModel):
                 }
             }
         }
+    )
 
 # === 3. Голосовой ответ (API JSON) ===
 class VoiceReply(BaseModel):
     reply_type: Literal["voice"] = "voice"
-    audio_url: str  # ссылка на .mp3/.ogg (выдаётся только для воспроизведения)
-    text_transcript: str  # транскрипция, полученная из STT
+    audio_url: str
+    text_transcript: str
     meta: Optional[Dict[str, Any]] = None
 
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
             "example": {
                 "reply_type": "voice",
                 "audio_url": "/media/audio/6e3b1ff8-abe8-4f2f-a9e2-3f5379c82d2a.mp3",
@@ -83,15 +82,16 @@ class VoiceReply(BaseModel):
                 }
             }
         }
+    )
 
-# === 4. Стандартный текстовый ответ (для обратной совместимости) ===
+# === 4. Стандартный текстовый ответ ===
 class TextReply(BaseModel):
     reply_type: Literal["text"] = "text"
     text: str
     meta: Optional[Dict[str, Any]] = None
 
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "reply_type": "text",
                 "text": "Ваш вопрос принят! Ожидайте ответа.",
@@ -104,18 +104,19 @@ class TextReply(BaseModel):
                 }
             }
         }
+    )
 
-# === 5. ErrorLog — для логирования ошибок и SLA событий ===
+# === 5. ErrorLog ===
 class ErrorLogRead(BaseModel):
-    id: UUID4
-    user_id: Optional[UUID4]
+    id: UUID
+    user_id: Optional[UUID]
     error: str
     details: Optional[dict]
     created_at: Optional[datetime]
 
-    class Config:
-        orm_mode = True
-        schema_extra = {
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
             "example": {
                 "id": "b98ae7b6-d6e5-11ec-9d64-0242ac120002",
                 "user_id": "12345678-1234-1234-1234-123456789abc",
@@ -130,20 +131,22 @@ class ErrorLogRead(BaseModel):
                 "created_at": "2025-07-16T09:23:44"
             }
         }
+    )
 
-# === 6. Прочие стандартные схемы (лиды, юзеры, подписки, сообщения) ===
+# === 6. SupportRequest, LeadRequest, User/Subscription/Session/Message схемы ===
 
 class SupportRequest(BaseModel):
     subject: Optional[str] = "Support request"
     message: str
 
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "subject": "Проблема с подпиской",
                 "message": "Не получается продлить подписку, выдает ошибку оплаты."
             }
         }
+    )
 
 class LeadRequest(BaseModel):
     user_id: str
@@ -173,8 +176,8 @@ class LeadRequest(BaseModel):
     is_duplicate: Optional[bool] = None
     original_id: Optional[str] = None
 
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "user_id": "12345",
                 "session_id": "abcde-12345",
@@ -203,65 +206,56 @@ class LeadRequest(BaseModel):
                 "original_id": "2fa6ee1"
             }
         }
+    )
 
-# --- User schemas ---
-class UserRead(BaseUser):
-    id: UUID4
+# --- User/Subscription/Session/Message ---
+
+class UserRead(BaseModel):
+    id: UUID
     created_at: Optional[datetime]
     updated_at: Optional[datetime]
+    model_config = ConfigDict(from_attributes=True)
 
-    class Config:
-        orm_mode = True
-
-class UserCreate(BaseUserCreate):
+class UserCreate(BaseModel):
     display_name: Optional[str] = None
     phone: Optional[str] = None
     tags: Optional[Dict] = None
     referral_code: Optional[str] = None
 
-class UserUpdate(BaseUserUpdate):
+class UserUpdate(BaseModel):
     display_name: Optional[str] = None
     phone: Optional[str] = None
     tags: Optional[Dict] = None
     referral_code: Optional[str] = None
 
-# --- Subscription schemas ---
 class SubscriptionBase(BaseModel):
     status: Optional[str] = "inactive"
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
 
 class SubscriptionRead(SubscriptionBase):
-    id: UUID4
-    user_id: UUID4
+    id: UUID
+    user_id: UUID
     created_at: Optional[datetime]
+    model_config = ConfigDict(from_attributes=True)
 
-    class Config:
-        orm_mode = True
-
-# --- Session schemas ---
 class SessionRead(BaseModel):
-    id: UUID4
-    user_id: UUID4
+    id: UUID
+    user_id: UUID
     created_at: Optional[datetime]
     expired_at: Optional[datetime]
+    model_config = ConfigDict(from_attributes=True)
 
-    class Config:
-        orm_mode = True
-
-# --- Message schemas ---
 class MessageRead(BaseModel):
-    id: UUID4
-    session_id: Optional[UUID4]
-    user_id: UUID4
+    id: UUID
+    session_id: Optional[UUID]
+    user_id: UUID
     role: str
     type: str
     status: str
     content: str
     meta: Optional[dict]
     created_at: Optional[datetime]
-
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 # --- END schemas.py ---

@@ -8,6 +8,12 @@ Celery configuration for Leadinc AI Assistant.
 
 import os
 from backend.config import REDIS_URL
+from kombu import Queue, Exchange
+
+from backend.utils.audio_constants import (
+    TTS_SOFT_TIME_LIMIT, TTS_HARD_TIME_LIMIT,
+    STT_SOFT_TIME_LIMIT, STT_HARD_TIME_LIMIT
+)
 
 # Core Celery settings
 broker_url = REDIS_URL
@@ -19,23 +25,13 @@ result_serializer = "json"
 accept_content = ["json"]
 
 # Queues (multi-stage best practice)
-task_queues = {
-    "text": {
-        "exchange": "text",
-        "routing_key": "text",
-    },
-    "audio": {
-        "exchange": "audio",
-        "routing_key": "audio",
-    },
-}
+task_queues = [
+    Queue("text", Exchange("text"), routing_key="text"),
+    Queue("audio", Exchange("audio"), routing_key="audio"),
+]
 
-# Time limits (SLA, см. требования)
-task_soft_time_limit = 90    # секунд — после этого будет Warning в логах, задача может доработать
-task_time_limit = 120        # секунд — hard kill, если задача “зависла” (например, ffmpeg, API)
-
-# Result expiration: храним статус задачи 2 часа (MVP)
-result_expires = 7200
+# Result expiration: храним статус задачи 15 минут (MVP)
+result_expires = 900
 
 # Retry policy (по дефолту, best practice)
 task_default_retry_delay = 5      # секунд между попытками

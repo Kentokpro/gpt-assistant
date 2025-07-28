@@ -12,6 +12,8 @@ Leadinc: SQLAlchemy ORM-модели для всех сущностей сист
 import uuid
 from datetime import datetime
 from typing import Optional
+from datetime import datetime
+import uuid
 
 from sqlalchemy import (
     Boolean,
@@ -26,7 +28,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
-from backend.database import Base
+from backend.database import Base, SessionLocal
 
 # --- User, Subscription, Session --- #
 
@@ -112,8 +114,53 @@ class Message(Base):
             return self.meta["audio"]
         return {}
 
-# --- Логи ошибок (в т.ч. SLA/timeout/ошибки STT/TTS) --- #
+    @classmethod
+    def save_voice_message(cls, user_id, session_id, content, meta, role="assistant"):
+        """
+        Сохраняет голосовое сообщение (voice) в БД.
+        user_id: str — ID пользователя
+        session_id: str — ID сессии
+        content: str — ссылка на аудиофайл (audio_url)
+        meta: dict — метаданные (transcript, параметры аудио, SLA, ошибки)
+        """
 
+        # Создаём sync-сессию (также работает из Celery)
+        with SessionLocalSync() as db:
+            msg = cls(
+                id=uuid.uuid4(),
+                session_id=session_id,
+                user_id=user_id,
+                role="assistant",    # или "user", если хочешь логировать пользовательский voice
+                type="voice",
+                status="ok",
+                content=content,
+                meta=meta,
+                created_at=datetime.utcnow()
+            )
+            db.add(msg)
+            db.commit()
+        return msg   
+
+    @classmethod
+    def save_voice_message_sync(cls, user_id, session_id, content, meta, role="assistant"):
+        from backend.database import SessionLocalSync  
+        with SessionLocalSync() as db:
+            msg = cls(
+                id=uuid.uuid4(),
+                session_id=session_id,
+                user_id=user_id,
+                role=role,
+                type="voice",
+                status="ok",
+                content=content,
+                meta=meta,
+                created_at=datetime.utcnow()
+            )
+            db.add(msg)
+            db.commit()
+        return msg
+
+# --- Логи ошибок (в т.ч. SLA/timeout/ошибки STT/TTS) --- #
 class ErrorLog(Base):
     __tablename__ = "error_logs"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -125,13 +172,16 @@ class ErrorLog(Base):
     user = relationship("User", back_populates="error_logs")
 
 # --- Логи событий аудио (для аудиостека и SLA monitoring) --- #
-
 class AudioEventLog(Base):
     __tablename__ = "audio_event_logs"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     session_id = Column(UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=True)
-    message_id = Column(UUID(as_uuid=True), ForeignKey("messages.id"), nullable=True)
+    message_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        nullable=True
+    ) 
     event_type = Column(String, nullable=False)   # "audio_created", "audio_deleted", "audio_played", "audio_expired", "audio_failed"
     file_path = Column(String, nullable=True)     # относительный путь к аудиофайлу
     status = Column(String, default="ok")         # "ok", "deleted", "failed", "timeout"
@@ -139,6 +189,24 @@ class AudioEventLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="audio_events")
+
+    @classmethod
+    def create_event(cls, user_id, session_id, event_type, file_path, status, details):
+        from backend.database import SessionLocalSync
+        with SessionLocalSync() as db:
+            event = cls(
+                id=uuid.uuid4(),
+                user_id=user_id,
+                session_id=session_id,
+                event_type=event_type,
+                file_path=file_path,
+                status=status,
+                details=details,
+                created_at=datetime.utcnow(),
+            )
+            db.add(event)
+            db.commit()
+        return event
 
 """
 --- Примечания ---

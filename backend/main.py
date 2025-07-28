@@ -10,7 +10,7 @@ Leadinc AI Backend — полный рефакторинг (2024-07)
 """
 
 import logging
-from fastapi import FastAPI, Request, Depends, HTTPException, APIRouter, Response
+from fastapi import FastAPI, Request, Depends, HTTPException, APIRouter, Response, UploadFile, File, BackgroundTasks, Form
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +21,11 @@ import uuid
 import time
 import re
 import os
+
+from backend.tasks.stt import stt_task
+from backend.tasks.tts import tts_task
+from backend.utils.stt_utils import save_upload_file
+from celery.result import AsyncResult
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -46,6 +51,80 @@ from backend.models import User, Message, Session as SessionModel
 from backend.schemas import UserRead, UserCreate, ChatRequest, SupportRequest
 from backend.database import SessionLocal
 from backend.chroma_utils import search_chunks_by_embedding, get_full_article
+
+from starlette.concurrency import run_in_threadpool
+
+# --- VOICE TRIGGERS ---
+VOICE_TRIGGER_PHRASES = [
+    "голос",
+    "ответь голосом",
+    "озвучь ответ",
+    "надиктуй пожалуйста",
+    "скажи вслух",
+    "прочитай мне",
+    "можешь проговорить",
+    "покажи голосом",
+    "дай аудио ответ",
+    "скажи, не пиши",
+    "голосом объясни",
+    "озвучь это",
+    "прочти",
+    "читай",
+    "говори",
+    "скажи словами",
+    "расскажи голосом",
+    "прямо голосом ответь",
+    "озвуч вариант",
+    "устно ответь",
+    "можешь вслух сказать",
+    "в аудио скажи",
+    "проговори ответ",
+    "скажи это вслух",
+    "не пиши, а говори",
+    "озвуч инфу",
+    "ответ голосовой",
+    "зачитай пожалуйста",
+    "голосовое сообщение",
+    "надиктуй ответ",
+    "прочитай вслух",
+    "скажи в микрофон",
+    "аудио пожалуйста",
+]
+
+TEXT_TRIGGER_PHRASES = [
+    "ответ текстом",
+    "напиши текстом",
+    "выведи текст",
+    "только текст",
+    "без аудио",
+    "без звука"
+    "текст",
+    "можно текстом?",
+    "напиши ответ",
+    "покажи в виде текста",
+    "расшифруй в текст",
+    "мне нужен текст",
+    "переведи в текст",
+    "отправь как текст",
+    "сделай текстовый ответ",
+    "напиши, что получилось",
+    "напиши это",
+    "что получилось в тексте?",
+    "мне удобнее текст",
+    "без озвучки",
+    "не говори",
+    "можно без звука?",
+    "дай только текст",
+    "ответь текстом",
+    "хочу увидеть текст",
+    "выведи только текст",
+    "выведи без звука",
+    "дублируй текстом",
+    "распознай текст",
+    "распиши текстом",
+    "ответ напиши",
+    "пиши",
+]
 
 # Миграция SessionLocal Depends
 async def get_db():
@@ -133,6 +212,47 @@ app = FastAPI(
     openapi_url=None
 )
 
+# Проверяет основные сервисы: Redis, Celery (наличие таски), OpenAI API KEY, ElevenLabs API KEY.
+@app.get("/health", tags=["infra"])
+async def health_check():
+    import os
+    from openai import AsyncOpenAI
+    from elevenlabs.client import ElevenLabs
+
+    health = {}
+
+    # Redis check
+    try:
+        pong = await redis.ping()
+        health["redis"] = "ok" if pong else "fail"
+    except Exception as e:
+        health["redis"] = f"fail: {e}"
+
+    # Celery (наличие задачи)
+    try:
+        # Пытаемся просто импортировать задачу (worker может быть не поднят)
+        tid = str(uuid.uuid4())
+        dummy_task = tts_task.AsyncResult(tid)
+        health["celery"] = "ok"
+    except Exception as e:
+        health["celery"] = f"fail: {e}"
+
+    # OpenAI KEY
+    try:
+        openai_key = os.getenv("OPENAI_API_KEY") or "NO"
+        health["openai_api_key"] = "ok" if openai_key and openai_key != "NO" else "not_set"
+        # можно попытаться сделать dummy-запрос к OpenAI (по желанию)
+    except Exception as e:
+        health["openai_api_key"] = f"fail: {e}"
+
+    # ElevenLabs KEY
+    try:
+        eleven_key = os.getenv("ELEVENLABS_API_KEY") or "NO"
+        health["elevenlabs_api_key"] = "ok" if eleven_key and eleven_key != "NO" else "not_set"
+    except Exception as e:
+        health["elevenlabs_api_key"] = f"fail: {e}"
+    return JSONResponse(health)
+
 @app.get("/auth/users/me", tags=["auth"])
 async def get_current_user(user=Depends(current_active_user_optional)):
     logger.info(f"Проверка авторизации: user={user}")
@@ -197,8 +317,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MEDIA_DIR = Path(__file__).parent / "media"
-MEDIA_DIR.mkdir(exist_ok=True)
+MEDIA_DIR = Path("/srv/leadinc-media/audio")
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -229,32 +349,155 @@ USER_LIMIT = 30
 # === 6. Основной AI endpoint — ЛОГИКА СЦЕНАРИЯ/СТАДИЙ ===
 @ai_router.post("/chat")
 async def chat(
-    payload: ChatRequest,
     request: Request,
     response: Response,
     user: User = Depends(current_active_user_optional),
     db: AsyncSession = Depends(get_db),
+    audio: UploadFile = File(None),
+    type_: str = Form(None),
 ):
-    content = payload.content
-    msg_type = payload.type
+    """
+    Универсальный endpoint /ai/chat: поддержка JSON и FormData (text, voice)
+    - Для текста: работает как раньше.
+    - Для голоса: парсит файл, делает STT, приводит к единому payload.
+    """
+    logger.info(f"==== [UNIVERSAL CHAT ENDPOINT] START ====")
+
+    session_id = get_or_create_session_id(request)
+    stage_key = f"stage:{session_id}"
+    raw_stage = await redis.get(stage_key)
+    if raw_stage is None:
+        stage = 1
+        await redis.set(stage_key, stage, ex=12*60*60)
+    else:
+        stage = int(raw_stage)
+        await redis.expire(stage_key, 12*60*60)
+    phone_redis = None
+    email_redis = None
+    context_chunks = []
+    messages_for_gpt = []
+    answer_format = None
+    msg_type = None
+    content = None
+    logger.info(f"[INIT] session_id={session_id}, stage={stage}")
+
+    # Блок обработки аудио
+    if audio and (type_ == "voice" or (audio.filename and audio.content_type in ["audio/mpeg", "audio/mp3", "audio/ogg", "audio/webm"])):
+        # --- Обработка аудио ---
+        logger.info(f"[VOICE] Detected audio input: {audio.filename}, type: {type_}")
+        try:
+            from backend.utils.stt_utils import save_upload_file
+            audio_path = await save_upload_file(audio)
+            logger.info(f"[VOICE] Saved audio file: {audio_path}")
+
+            from backend.tasks.stt import stt_task
+            stt_result = await run_in_threadpool(lambda: stt_task.apply_async(args=[audio_path, None, None]).get(timeout=60))
+            logger.info(f"[VOICE] STT result: {stt_result}")
+
+            if stt_result.get("status") != "ok" or not stt_result.get("transcript"):
+                return JSONResponse(
+                    {
+                        "reply": "Ошибка распознавания речи. Попробуйте ещё раз.",
+                        "meta": {"stage": 1, "reason": "stt_error"}
+                    }, status_code=400
+                )
+            msg_type = "voice"
+
+            # после STT (speech-to-text) результата:
+            payload = {
+                "content": stt_result["transcript"],
+                "type": "voice",
+                "audio_path": audio_path,
+                "answer_format": answer_format,
+                "audio_meta": {
+                    "filename": audio.filename,
+                    "content_type": audio.content_type,
+                }
+            }
+
+            # Дальше payload всегда dict!
+            content = payload.get("content", "")
+            msg_type = payload.get("type", "text")
+            answer_format = payload.get("answer_format")
+
+        except Exception as e:
+            logger.error(f"[VOICE] Error while processing audio: {e}")
+            return JSONResponse(
+                {
+                    "reply": "Ошибка обработки голосового сообщения.",
+                    "meta": {"stage": 1, "reason": "voice_processing_error", "details": str(e)}
+                }, status_code=500
+            )
+
+    else:
+        # --- Обработка обычного текста (JSON) ---
+        logger.info(f"[TEXT] Detected text input (JSON or fallback)")
+        try:
+            body = await request.body()
+            data = json.loads(body)
+            payload = {
+                "content": data.get("content", ""),
+                "type": data.get("type", "text"),
+                "answer_format": data.get("answer_format", "text"),
+            }
+
+        except Exception as e:
+            logger.error(f"[TEXT] Ошибка парсинга JSON: {e}")
+            return JSONResponse(
+                {
+                    "reply": "Ошибка в формате запроса. Проверьте поля!",
+                    "meta": {"stage": 1, "reason": "json_parse_error", "details": str(e)}
+                }, status_code=422
+            )
+
+    # --- Единая точка после веток: payload уже определён ---
+    content = payload.get("content", "")
+    msg_type = payload.get("type", "text")
+    answer_format = payload.get("answer_format")  # может быть None
+
+    content_lower = content.lower() if isinstance(content, str) else ""
+
+    # --- Определяем, просит ли пользователь текст/войс через триггеры ---
+    is_voice_trigger = any(trigger in content_lower for trigger in VOICE_TRIGGER_PHRASES)
+    is_text_trigger = any(trigger in content_lower for trigger in TEXT_TRIGGER_PHRASES)
+
+    # --- Логика выбора формата ответа строго по чек-листу ---
+
+    if msg_type == "voice" and (answer_format == "text" or is_text_trigger):
+        # Пользователь прислал ВОЙС и ЯВНО ПРОСИТ ТЕКСТ — выдаём только текст
+        answer_format = "text"
+    elif msg_type == "voice":
+        # Пользователь прислал ВОЙС (без просьбы о тексте) — выдаём только войс
+        answer_format = "voice"
+    elif answer_format == "voice" or is_voice_trigger:
+        # Пользователь прислал ТЕКСТ и ЯВНО просит голос — выдаём только войс
+        answer_format = "voice"
+    else:
+        # В остальных случаях — только текст
+        answer_format = "text"
+    logger.info(f"[PAYLOAD] content={content!r}, msg_type={msg_type}, answer_format={answer_format}")
+
+
     session_id = get_or_create_session_id(request)
 
     logger.info(f"--- NEW CHAT REQ --- session={session_id} user={getattr(user, 'id', None)} content='{content[:40]}'")
 
     # ====== ВСЯ ЛОГИКА В ОДНОМ БЛОКЕ ТРАНЗАКЦИИ ======
     async with db.begin():
+        # --- 0. Сессия пользователя (SessionModel) ---
         q = select(SessionModel).where(SessionModel.id == session_id)
         result = await db.execute(q)
         existing = result.scalar_one_or_none()
         if not existing:
             db.add(SessionModel(id=session_id))
-            await db.flush()  # <<--- ДОБАВЛЕНО!
-        logger.info(f"SessionModel for {session_id}: {'created' if not existing else 'exists'}")    
-        # --- 0. "Память" для AI: какие поля уже есть в Redis? ---
+            await db.flush()  # [OK]
+        logger.info(f"SessionModel for {session_id}: {'created' if not existing else 'exists'}")
+
+        # --- 1. Память для AI: phone/email в Redis ---
         phone_redis = await redis.get(f"reg_phone:{session_id}")
         email_redis = await redis.get(f"reg_email:{session_id}")
 
-        # --- 1. Stage определяем ЖЁСТКО для авторизованных ---
+        # --- 2. Определение этапа (stage) ---
         if user:
             stage = 4
             logger.info(f"User is authorized. Forcing stage=4 for user_id={user.id}, session={session_id}")
@@ -270,7 +513,7 @@ async def chat(
                 await redis.expire(stage_key, 12*60*60)
                 logger.info(f"Stage for session {session_id}: {stage}")
 
-        # --- 2. Лимиты, спам, ограничения ---
+        # --- 3. Лимиты, спам, guest limits ---
         lim_prefix = f"{user.id}" if user else session_id
         msg_count_key = f"msg_count:{lim_prefix}:stage{stage}"
         msg_count = int(await redis.get(msg_count_key) or 0)
@@ -296,9 +539,10 @@ async def chat(
                     "reply": "Достигнут лимит сообщений. Для продолжения требуется регистрация.",
                     "meta": {"stage": 3, "reason": "guest_limit"}
                 }), session_id)
-            # Flood protection (гостям)
+        
+        # Flood protection (гостям)
         if not user:
-            client_ip = request.client.host  # <-- Получаем IP гостя
+            client_ip = request.client.host
             ip_ban_key = f"guest_ip_ban:{client_ip}"
             is_banned = await redis.exists(ip_ban_key)
             if is_banned:
@@ -313,10 +557,9 @@ async def chat(
         await redis.zadd(zset_key, {str(now): now})
         guest_msgs = await redis.zcount(zset_key, ten_minutes_ago(), now)
         if guest_msgs > 20:
-            # ДОБАВЬ ЭТО:
             client_ip = request.client.host
             ip_ban_key = f"guest_ip_ban:{client_ip}"
-            await redis.set(ip_ban_key, 1, ex=2*60*60)  # бан по ip на 2 часа
+            await redis.set(ip_ban_key, 1, ex=2*60*60)
             logger.warning(f"Flood protection + IP BAN: guest, session={session_id}, ip={client_ip}")
             return set_session_cookie(JSONResponse({
                 "reply": "Временная блокировка на 2 часа.",
@@ -326,6 +569,7 @@ async def chat(
         await redis.incr(msg_count_key)
         await redis.expire(msg_count_key, 600)
 
+        # --- 4. Лимиты пользователей ---
         if user:
             today = time.strftime("%Y-%m-%d")
             project_limit_key = f"project_count:{user.id}:{today}"
@@ -351,7 +595,6 @@ async def chat(
             await redis.zadd(zset_key, {str(uuid.uuid4()): now})
             msg_in_window = await redis.zcount(zset_key, ten_minutes_ago(), now)
             if msg_in_window > USER_LIMIT:
-        # СТАВИМ БЛОКИРОВКУ на 2 часа!
                 await redis.set(block_key, 1, ex=7200)
                 logger.warning(f"User msg limit EXCEEDED. user_id={user.id} session={session_id}")
                 return set_session_cookie(JSONResponse({
@@ -359,12 +602,11 @@ async def chat(
                     "meta": {"stage": 4, "reason": "msg_limit_exceeded"}
                 }), session_id)
 
-        # ============ Блок поиска в базе знаний (RAG) ============
+        # ============ RAG-поиск (база знаний) ============
         context_chunks = []
         if user and stage == 4:
             try:
                 query_emb = await get_embedding(content)
-                result = await search_chunks_by_embedding(query_emb, n_results=5, collection_name="faq_leadinc")
                 context_chunks = await search_chunks_by_embedding(query_emb, n_results=5, collection_name="faq_leadinc")
                 if context_chunks:
                     log_context = [
@@ -402,14 +644,14 @@ async def chat(
         logger.info(f"any: {any(key in user_input for key in SHORT_CONFIRM)}")
         logger.info(f"session_id: {session_id!r}")
 
-        # --- A. Всегда сначала создаем SessionModel если нет ---
+        # --- A. SessionModel ---
         q = select(SessionModel).where(SessionModel.id == session_id)
         result = await db.execute(q)
         existing = result.scalar_one_or_none()
         if not existing:
             db.add(SessionModel(id=session_id))
 
-        # --- B. Всегда сохраняем сообщение пользователя (user) ---
+        # --- B. Сохраняем сообщение пользователя ---
         try:
             user_id = user.id if user else None
             user_msg = Message(
@@ -426,7 +668,7 @@ async def chat(
             logger.error(f"DB error while saving user message: {str(e)}")
             print(f"Return: DB error (user message), session={session_id}")
 
-            # --- [БЛОК] "Да/Ок/Подробнее" → full_article (короткий путь, без вызова OpenAI) ---
+        # --- [БЛОК] "Да/Ок/Подробнее" → full_article (короткий путь, без вызова OpenAI) ---
         if pending_article_id and any(key in user_input for key in SHORT_CONFIRM):
             try:
                 # 1. Получаем все чанки по article_id (через filter_chunks)
@@ -447,7 +689,7 @@ async def chat(
                     logger.warning(f"Статья с article_id={pending_article_id} не найдена или пуста.")
                     await redis.delete(f"pending_full_article:{session_id}")
                     return set_session_cookie(JSONResponse({
-                        "reply": "Статья не найдена или временно недоступна.",
+                        "reply": "Ошибка при поиске информации.",
                         "meta": {
                             "stage": stage,
                             "action": "full_article",
@@ -455,10 +697,10 @@ async def chat(
                         }
                     }), session_id)
 
-                # 3. Удаляем pending_full_article, чтобы не было повторов
+                # 3. Удаляем pending_full_article
                 await redis.delete(f"pending_full_article:{session_id}")
                 logger.info(f"[DEBUG] Ключ pending_full_article:{session_id} удалён после выдачи полной статьи")
-        
+
                 q = (
                     select(Message)
                     .where(Message.session_id == session_id)
@@ -469,10 +711,10 @@ async def chat(
                 msgs_keep = result.scalars().all()[::-1]
                 messages_for_gpt = [{"role": msg.role, "content": msg.content} for msg in msgs_keep]
 
-                # 4. Готовим запрос к ассистенту для выдачи полной статьи (context уже сшит)
                 ai_response = await ask_openai(
                     content=content,
                     msg_type="text",
+                    answer_format=payload.get("answer_format"),
                     stage=stage,
                     user_authenticated=bool(user),
                     phone=phone_redis,
@@ -497,7 +739,7 @@ async def chat(
                             "article_id": pending_article_id,
                             "contract_error": True
                         }
-                }), session_id)
+                    }), session_id)
 
                 # 5. Сохраняем сообщение ассистента (выдача полной статьи)
                 try:
@@ -514,7 +756,7 @@ async def chat(
                 except Exception as e:
                     logger.error(f"DB error while saving assistant message (full_article): {str(e)}")
 
-                # 6. Обрезаем историю до 10 последних сообщений (как обычно)
+                # 6. Обрезаем историю до 10 последних сообщений
                 q = (
                     select(Message)
                     .where(Message.session_id == session_id)
@@ -538,7 +780,7 @@ async def chat(
                             Message.__table__.delete().where(Message.id.in_(ids_del))
                         )
                 await db.commit()
-        
+
                 # Возврат пользователю через session cookie
                 return set_session_cookie(JSONResponse({
                     "reply": ai_response["reply"],
@@ -562,7 +804,6 @@ async def chat(
                         "error": str(e)
                     }
                 }), session_id)
-
         messages_for_gpt = []
         q = (
             select(Message)
@@ -571,7 +812,9 @@ async def chat(
             .limit(10)
         )
         result = await db.execute(q)
-        msgs_keep = result.scalars().all()[::-1]  # сначала старые
+        msgs_keep = result.scalars().all()[::-1]  # старые сообщения в начало
+
+        # Для обрезки истории — все сообщения по сессии
         q_all = (
             select(Message)
             .where(Message.session_id == session_id)
@@ -588,28 +831,27 @@ async def chat(
                 )
         messages_for_gpt = [{"role": msg.role, "content": msg.content} for msg in msgs_keep]
 
-        # --- 3. Формируем user_prompt для ассистента с памятью/контекстом ---
-        phone_redis = await redis.get(f"reg_phone:{session_id}")    
-        email_redis = await redis.get(f"reg_email:{session_id}")  
-        ai_response = await ask_openai(  
-            content=content,  
-            msg_type=msg_type,  
-            stage=stage,  
-            user_authenticated=bool(user),  
-            phone=phone_redis,  
-            email=email_redis,  
+        # --- 3. Блок генерации ответа от OpenAI с памятью/контекстом ---
+        ai_response = await ask_openai(
+            content=content,
+            msg_type=msg_type,
+            answer_format=answer_format,
+            stage=stage,
+            user_authenticated=bool(user),
+            phone=phone_redis,
+            email=email_redis,
             context=context_chunks if context_chunks else [],
-            messages=messages_for_gpt  
-        )  
+            messages=messages_for_gpt
+        )
         logger.info(f"ai_response: {ai_response}")
 
-        # --- Теперь сохраняем сообщение ассистента (AI) ---
+        # --- Сохраняем сообщение ассистента (AI) ---
         try:
             assistant_msg = Message(
                 session_id=session_id,
-                user_id=user_id,
+                user_id=user_id if 'user_id' in locals() else (user.id if user else None),
                 role="assistant",
-                type="text",
+                type=msg_type,
                 status="ok",
                 content=ai_response["reply"],
                 meta=ai_response.get("usage", {}),
@@ -618,7 +860,9 @@ async def chat(
         except Exception as e:
             logger.error(f"DB error while saving assistant message (AI): {str(e)}")
 
-        # --- После этого — снова обрезаем историю (memory) до 10 ---
+        response_payload = None
+
+        # --- После этого — снова обрезаем историю до 10 последних сообщений ---
         q = (
             select(Message)
             .where(Message.session_id == session_id)
@@ -641,44 +885,14 @@ async def chat(
                 await db.execute(
                     Message.__table__.delete().where(Message.id.in_(ids_del))
                 )
-        # await db.commit() — не нужен, транзакция закроется автоматически
 
-        # 1. Если GPT просит "предложить полную статью" (короткий ответ, ждем подтверждения)
+        # --- 1. Если GPT просит "предложить полную статью" (короткий ответ, ждем подтверждения)
         action = ai_response.get("action") or ai_response.get("fields", {}).get("action")
         article_id = ai_response.get("article_id") or ai_response.get("fields", {}).get("article_id")
         if action == "offer_full_article" and article_id:
             await redis.set(f"pending_full_article:{session_id}", article_id, ex=3600)
 
-        # 2. Если GPT сразу говорит "выдать полную статью" (например, при прямом запросе)
-#        if ai_response.get("action") == "full_article" and ai_response.get("article_id"):
-#            article_id = ai_response.get("article_id")
-#            try:
-#                article_text = await get_full_article(article_id)
-#                await redis.delete(f"pending_full_article:{session_id}")
-#                logger.info(f"[DEBUG] Сохраняем pending_full_article:{session_id} = {article_id}")
-#                await db.commit()  # Зафиксировать все перед return
-#                return set_session_cookie(JSONResponse({
-#                    "reply": article_text,
-#                    "meta": {
-#                        "stage": stage,
-#                        "action": "full_article",
-#                        "article_id": article_id,
-#                    }
-#                }), session_id)
-#            except Exception as e:
-#                logger.error(f"Ошибка выдачи полной статьи по article_id={article_id}: {e}")
-#                await db.rollback()
-#                return set_session_cookie(JSONResponse({
-#                    "reply": "Техническая ошибка. Не удалось получить полный текст.",
-#                    "meta": {
-#                        "stage": stage,
-#                        "action": "full_article",
-#                        "article_id": article_id,
-#                        "error": str(e)
-#                    }
-#                }), session_id)
-
-        # ai_response: reply, stage, fields (phone/email/niche/city), [token], [dev_creds]
+        # --- ai_response: reply, stage, fields, [token], [dev_creds]
         new_stage = ai_response.get('stage', stage)
         fields = ai_response.get('fields', {})
         if "action" in ai_response:
@@ -703,8 +917,8 @@ async def chat(
 
         if updated:
             logger.info(f"[PATCH] reg_phone:{session_id}={phone_redis}, reg_email:{session_id}={email_redis}")
-
-        # --- A. BACKEND-ВАЛИДАЦИЯ КОДА для перехода с 1 на 2 этап ---
+        
+	    # --- A. BACKEND-ВАЛИДАЦИЯ КОДА для перехода с 1 на 2 этап ---
         if not user and stage == 1 and new_stage == 2:
             user_code = fields.get("code")
             if not user_code:
@@ -785,18 +999,18 @@ async def chat(
                 dev_block = (
                     "\n\n------------------------\n"
                     "[альфа тест]\n"
-                    "Вы зарегистрированы! Теперь вам доступен расширенный функционал Leadinc.\n"
+                    "Вы автоматически авторизованы и зарегистрированы! Теперь вам доступен расширенный функционал Leadinc.\n"
                     f"Ваши данные для входа:\n"
                     f"Телефон: {phone_final}\n"
                     f"Email: {email_final}\n"
                     f"Пароль: {password}\n"
-                    "Вы автоматически авторизованы.\n"
                     "------------------------"
                 )
                 ai_response["reply"] = (ai_response.get("reply") or "") + dev_block
                 logger.info(f"Новый пользователь зарегистрирован: email={email_final}, phone={phone_final}")
                 print(f"[DEBUG] Generated password for {email_final}: {password}")
                 logger.info(f"Final AI reply: {ai_response['reply']}")
+                
                 # Очищаем временные ключи (и autoочистка на 5 дней)
                 await redis.delete(f"stage:{session_id}")
                 await redis.delete(f"reg_phone:{session_id}")
@@ -845,29 +1059,78 @@ async def chat(
                 return set_session_cookie(JSONResponse({
                     "reply": "Техническая ошибка регистрации. Попробуйте снова.",
                     "meta": {"stage": 3, "reason": "register_error"}
-            }), session_id)
+                }), session_id)
 
-    # --- Сбор финального ответа ---
-    reply = ai_response.get("reply", "")
-    if not isinstance(reply, str):
-        reply = json.dumps(reply, ensure_ascii=False)
-    
-    response_data = {
-        "reply": reply,
-        "meta": {
-            "stage": new_stage,
-            "usage": ai_response.get("usage", {}),
-            "fields": fields,
-            "token": ai_response.get("token")
-        }
-    }
+        # --- Сбор финального ответа и поддержка voice-ответа ---
+        reply = ai_response.get("reply", "")
+        if not isinstance(reply, str):
+            reply = json.dumps(reply, ensure_ascii=False)
 
-    logger.info(f"Final response: stage={new_stage}, session={session_id}, user={getattr(user, 'id', None)}")
-    print(f"Return: Final, session={session_id}, stage={new_stage}, cookie={session_id}")
+        # --- Централизованный return ответа ассистента (строго по answer_format) ---
+        if answer_format == "voice":
+            # Генерируем войс через TTS (Celery)
+            tts_format = payload.get("tts_format", "mp3")
+            if tts_format not in supported_formats:
+                logger.warning(f"[VOICE] Некорректный tts_format '{tts_format}', принудительно mp3")
+                tts_format = "mp3"
+            logger.info(f"[VOICE] Выбран формат TTS: {tts_format}")
 
-    await db.commit()
-    return set_session_cookie(JSONResponse(response_data), session_id)
+            try:
+                from backend.tasks.tts import tts_task
+                tts_result = await run_in_threadpool(
+                    lambda: tts_task.apply_async(
+                        args=[reply, None, str(getattr(user, "id", None)), session_id, tts_format]
+                    ).get(timeout=60)
+                )
+                logger.info(f"[DEBUG] tts_result: {tts_result}")
+                if tts_result and tts_result.get("status") == "ok" and tts_result.get("audio_url"):
+                    response_payload = {
+                        "reply_type": "voice",
+                        "audio_url": tts_result["audio_url"],
+                        "meta": tts_result.get("meta", {}),
+                    }
+                else:
+                    response_payload = {
+                        "reply_type": "voice",
+                        "audio_url": None,
+                        "meta": {
+                            "stage": new_stage,
+                            "usage": ai_response.get("usage", {}),
+                            "fields": fields,
+                            "tts_error": (
+                                tts_result.get("error", "unknown") if 'tts_result' in locals() and tts_result else str(e) if                'e' in locals() else "TTS error"
+                            )
+                        }
+                    }
+            except Exception as e:
+                logger.error(f"TTS voice generation failed: {e}")
+                response_payload = {
+                    "reply_type": "voice",
+                    "audio_url": None,
+                    "meta": {
+                        "stage": new_stage,
+                        "usage": ai_response.get("usage", {}),
+                        "fields": fields,
+                        "tts_error": (
+                                tts_result.get("error", "unknown") if 'tts_result' in locals() and tts_result else str(e) if                'e' in locals() else "TTS error"
+                        )
+                    }
+                }
+        else:
+            response_payload = {
+                "reply_type": "text",
+                "reply": reply,
+                "meta": {
+                    "stage": new_stage,
+                    "usage": ai_response.get("usage", {}),
+                    "fields": fields,
+                }
+            }
+        logger.debug(f"[RESPONSE_PAYLOAD]: {json.dumps(response_payload, ensure_ascii=False, indent=2)}")
+        await db.commit()
+        return set_session_cookie(JSONResponse(response_payload), session_id)
 
+# Блок RAG логики
 @ai_router.post("/rag")
 async def rag_search(
     payload: ChatRequest,
@@ -946,6 +1209,54 @@ async def rag_search(
         status_code=200
     )
 
+@ai_router.post("/voice_upload")
+async def voice_upload(
+    file: UploadFile = File(...),
+    session_id: str = Form(...),  # Или получи через cookie/Depends
+    user: User = Depends(current_active_user_optional)
+):
+    # 1. Сохраняем файл на диск асинхронно
+    audio_path = await save_upload_file(file)
+    user_id = str(user.id) if user else None
+
+    # 2. Кидаем задачу в Celery (важно — sync вызов в async-функции!)
+    task = stt_task.apply_async(args=[audio_path, user_id, session_id])
+
+    return {"task_id": task.id, "status": "pending"}
+
+@ai_router.post("/tts")
+async def tts_generate(
+    text: str = Form(...),
+    voice_id: str = Form(None),
+    output_format: str = Form("mp3"),
+    session_id: str = Form(...),
+    user: User = Depends(current_active_user_optional)
+):
+    user_id = str(user.id) if user else None
+    try:
+        task = tts_task.apply_async(args=[text, voice_id, user_id, session_id, output_format])
+        if not task or not task.id:
+            logger.error(f"TTS Celery: Не удалось отправить задачу в очередь (task=None) | user={user_id}")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "status": "failed",
+                    "error": "Не удалось отправить задачу TTS в очередь.",
+                    "meta": {"stage": 4, "user_id": user_id}
+                }
+            )
+        logger.info(f"TTS Celery: задача отправлена | task_id={task.id} | user={user_id}")
+        return {"task_id": task.id, "status": "pending"}
+    except Exception as e:
+        logger.error(f"TTS Celery: Ошибка отправки задания | user={user_id} | error={e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "failed",
+                "error": f"TTS Celery: Ошибка отправки задания: {e}",
+                "meta": {"stage": 4, "user_id": user_id}
+            }
+        )
 
 @app.post("/auth/jwt/logout", tags=["auth"])
 async def logout(request: Request, response: Response):
@@ -1000,4 +1311,3 @@ async def add_analytics_headers(request: Request, call_next):
     return response
 
 app.include_router(ai_router)
-
