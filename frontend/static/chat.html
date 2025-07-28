@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+      <meta charset="UTF-8">
+      <title>LEADINC. ТЕРМИНАЛ</title>
+      <meta name="viewport" content="width=1200">
+      <link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
+      <style>
+        html, body {
+          width: 100vw; height: 100vh; margin: 0; padding: 0;
+          background: #101d10;
+          color: #a6ff59;
+          font-family: 'VT323', monospace;
+          font-size: 23px;
+          overflow: hidden;
+        }
+        body::before {
+          content: '';
+          position: fixed; left: 0; top: 0; width: 100vw; height: 100vh;
+          pointer-events: none;
+          background: repeating-linear-gradient(
+            to bottom,
+            rgba(166,255,89,0.018) 0px,
+            rgba(166,255,89,0.04) 2px,
+            transparent 6px,
+            transparent 14px
+          );
+          z-index: 1;
+        }
+        body::after {
+          content: '';
+          position: fixed;
+          inset: 0;
+          border: 7px solid #50ff00;
+          border-radius: 27px;
+          pointer-events: none;
+          opacity: 0.21;
+          z-index: 2;
+          box-shadow: 0 0 64px #00ff50, 0 0 44px #1effa2 inset;
+        }
+        #terminal {
+          position: absolute;
+          left: 50%; top: 50%; transform: translate(-50%, -50%);
+          width: 85vw; height: 90vh;
+          background: #121812;
+          border: 3px solid #72ff37;
+          border-radius: 18px;
+          box-shadow: 0 0 64px 0 #1aff73, 0 0 0 14px #111;
+          display: flex; flex-direction: column; z-index: 10;
+          overflow: hidden;
+        }
+        #term-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 16px 40px 0 42px;
+          color: #A6FF59;
+          font-size: 1.45em;
+          font-family: inherit;
+          letter-spacing: 3px;
+          font-weight: bold;
+          text-shadow: 0 0 8px #7dff7a;
+        }
+        #login-toggle-btn {
+          background: #101d10; border: 2px solid #65ff33;
+          color: #e7ffc3; cursor: pointer; padding: 10px 32px;
+          font-size: 1.05em; font-family: inherit; font-weight: bold;
+          letter-spacing: 2px; border-radius: 7px;
+          margin-left: 24px; margin-top: 0; margin-bottom: 0;
+          transition: background 0.15s, color 0.13s, border-color 0.13s;
+        }
+        #login-toggle-btn:hover { background: #50ff00; color: #172a17; border-color: #fff232; }
+        #logout-btn {
+          background: #101d10;
+          border: 2px solid #65ff33;
+          color: #a6ff59;
+          font-family: inherit;
+          padding: 11px 34px;
+          font-size: 1.04em;
+          border-radius: 7px;
+          font-weight: bold;
+          transition: background 0.12s, color 0.1s, border-color 0.1s;
+          box-shadow: 0 0 11px 1px #65ff3363;
+          margin-left: 14px;
+          display: none;
+        }
+        #logout-btn:hover {
+          background: #50ff00;
+          color: #172a17;
+          border-color: #fff232;
+        }
+        #term-nav {
+          display: flex; flex-direction: row; align-items: center; gap: 32px;
+          padding: 4px 0 4px 42px;
+          font-size: 1.08em; color: #C8FF99; opacity: 0.7;
+          border-bottom: 1px solid #315C2B;
+        }
+        #term-main {
+          flex: 1 1 auto; display: flex; flex-direction: row; height: 100%;
+          z-index: 5; min-height: 0;
+        }
+        #left-block {
+          width: 56%;
+          min-width: 400px;
+          display: flex;
+          flex-direction: column;
+          flex: 1 1 auto;
+          min-height: 0;
+          min-width: 0;
+          border-right: 1.4px solid #2fff777a;
+          padding: 26px 22px 14px 40px;
+          background: transparent;
+          position: relative;
+        }
+        #right-block {
+          width: 44%; min-width: 340px; height: 100%;
+          padding: 24px 28px 14px 30px;
+          display: flex; flex-direction: column; justify-content: flex-start;
+          align-items: flex-start; overflow-y: auto; border-radius: 0 18px 18px 0;
+          background: transparent;
+        }
+        #dashboard-title {
+          color: #b6ff90;
+          font-size: 1.16em;
+          font-weight: bold;
+          margin-bottom: 14px;
+          letter-spacing: 1.5px;
+          text-shadow: 0 0 3.5px #4bff64;
+        }
+        #dashboard-content { color: #93ff7d; font-size: 1.07em; }
+        #dashboard-empty { color: #50f35a90; font-size: 1.05em; margin-top: 9px; font-family: inherit; }
+        #chat-block {
+          width: 100%;
+          display: flex;
+          flex-direction: column;
+          flex: 1 1 auto;
+          min-height: 0;
+          min-width: 0;
+          gap: 13px;
+        }
+        #chat-messages {
+          flex: 1 1 auto;
+          width: 100%;
+          min-height: 0;
+          overflow-y: auto;
+          padding: 6px 0 2px 0;
+          display: flex;
+          flex-direction: column;
+          gap: 13px;
+          font-size: 1.04em;
+          background: transparent;
+          scroll-behavior: smooth;
+        }
+        .msg-row { display: flex; }
+        .msg.user {
+          margin-left: auto; background: rgba(166,255,89,0.09);
+          color: #d4ffbc;
+          border-radius: 8px 2px 10px 10px;
+          max-width: 76%; box-shadow: 0 0 6px 1px #91ffbb30;
+          padding: 11px 18px; white-space: pre-line;
+          opacity: 0; animation: fadein-right .38s forwards;
+          font-family: inherit;
+        }
+        .msg.assistant {
+          margin-right: auto; background: rgba(89,255,166,0.08);
+          color: #b6ff90;
+          border-radius: 2px 10px 10px 10px;
+          max-width: 76%; box-shadow: 0 0 8px 1px #baffd530;
+          padding: 11px 18px; white-space: pre-line;
+          opacity: 0; animation: fadein-left .38s forwards;
+          font-family: inherit; position: relative;
+        }
+        .msg.assistant .audio-reply-player {
+          display: block;
+          margin-top: 9px;
+          margin-bottom: 2px;
+        }
+        @keyframes fadein-right { to {opacity:1; transform: translateX(0);} from {opacity:0; transform:translateX   (55px);} }
+        @keyframes fadein-left { to {opacity:1; transform: translateX(0);} from {opacity:0; transform:translateX    (-55px);} }
+        #chat-input-row {
+          width: 100%; display: flex; flex-direction: row; align-items: center; gap: 0;
+          padding: 0 40px 28px 40px;
+          background: transparent;
+          z-index: 10;
+          box-sizing: border-box;
+        }
+        #chat-input {
+          flex: 1 1 auto; min-width: 0; padding: 12px 10px; margin: 0;
+          font-size: 1.08em; background: #0019003d;
+          border: 2px solid #65ff33; border-radius: 5px 0 0 5px;
+          color: #b6ff90;
+          transition: border-color 0.18s;
+          outline: none; font-family: inherit;
+        }
+        #chat-input:focus { border-color: #fff232; background: #003c094d; }
+        .terminal-btn {
+          background: #1a2612; border: 2px solid #65ff33;
+          color: #e7ffc3; cursor: pointer; padding: 12px 36px;
+          font-size: 1.07em; font-family: inherit; font-weight: bold;
+          letter-spacing: 2px; border-radius: 0 0 0 0;
+          margin: 0; transition: background 0.15s, color 0.13s, border-color 0.13s;
+          border-radius: 0 5px 5px 0;
+        }
+        .terminal-btn:hover { background: #50ff00; color: #172a17; border-color: #fff232; }
+        .voice-btn {
+          border: 2px solid #65ff33; color: #fff; background: #17240e;
+          margin-left: 10px; padding: 12px 38px;
+          font-size: 1.09em; border-radius: 5px;
+          cursor: pointer; position: relative; top: 0;
+          font-family: inherit;
+          transition: background 0.17s, color 0.15s, border-color 0.13s;
+        }
+        .voice-btn.recording {
+          color: #101d10; background: #b2ff7f; border-color: #fff232;
+          animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+          0% { box-shadow: 0 0 0 0 #fff232; }
+          70% { box-shadow: 0 0 7px 6px #fff23266; }
+          100% { box-shadow: 0 0 0 0 #fff232; }
+        }
+        input::placeholder { color: #73ffbe; opacity: 0.45; }
+        #login-modal {
+          display: none; position: fixed; z-index: 9001;
+          left: 0; top: 0; width: 100vw; height: 100vh;
+          background: rgba(30, 51, 19, 0.89); align-items: center; justify-content: center;
+          font-family: inherit;
+        }
+        #login-modal.active { display: flex; }
+        #login-form {
+          background: #1a2417; border: 2px solid #2b2; border-radius: 10px;
+          box-shadow: 0 0 20px 6px #39ff6a50; padding: 28px 32px 22px 32px;
+          display: flex; flex-direction: column; align-items: center; gap: 11px;
+          font-family: inherit;
+        }
+        #login-error { color: #ff726f; min-height: 17px; margin-top: 6px; font-family: inherit; }
+        #term-footer {
+          width: 100%; border-top: 1.5px solid #26ff72;
+          color: #b0ff80; background: transparent; font-size: 1.09em;
+          text-align: center; display: flex; flex-direction: row;
+          justify-content: space-between; align-items: center;
+          padding: 6px 36px 6px 36px; font-family: inherit;
+          box-sizing: border-box;
+        }
+        #footer-links a {
+          color: #77d24c; text-decoration: underline; margin-right: 18px; opacity: 0.8;
+        }
+        #footer-links a:hover { color: #A6FF59; opacity: 1; }
+        #terminal::before {
+          content: '';
+          pointer-events: none; position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+          background: repeating-linear-gradient(
+            to bottom,
+            rgba(166,255,89,0.021) 0px,
+            rgba(166,255,89,0.03) 2px,
+            transparent 4px,
+            transparent 13px
+          );
+          z-index: 3; border-radius: 18px;
+        }
+        .blinking-cursor {
+          font-weight: bold; color: #dbff59;
+          animation: blink 1.1s steps(2, start) infinite;
+          margin-left: 2px; font-size: 1em;
+        }
+        @keyframes blink { to { opacity: .2; } }
+        @media (max-width: 1100px) {
+          #terminal { width: 99vw; height: 97vh; min-width: 0; }
+          #left-block, #right-block { padding: 13px 7px 9px 7px; }
+          #term-footer { padding: 4px 6px 3px 6px; font-size:0.98em; }
+          #chat-input-row { padding: 0 7px 13px 7px; }
+        }
+      </style>
+    
+
+
+</head>
+<body>
+    <!-- Здесь должна быть твоя HTML структура чата -->
+    <div id="terminal">
+      <div id="term-header">
+        <span>LEADINC.<span class="blinking-cursor">█</span></span>
+        <div>
+          <button id="login-toggle-btn" onclick="openLoginModal()">Войти как клиент</button>
+          <button id="logout-btn">Выйти</button>
+        </div>
+      </div>
+      <div id="term-nav">Главная &gt; Терминал</div>
+      <div style="padding:7px 0 0 40px;color:#b0ff80;font-size:1.14em;">
+        ТЕРМИНАЛ ПОЛУЧЕНИЯ КЛИЕНТОВ
+      </div>
+      <div id="term-main">
+        <!-- Левая часть (чат) -->
+        <div id="left-block">
+          <div id="chat-block" class="active">
+            <div id="chat-messages"></div>
+            <!-- Форма ввода чата и кнопки всегда по сетке -->
+            <div id="chat-input-row">
+              <input id="chat-input" autocomplete="off" placeholder="Введите сообщение..." />
+              <input type="checkbox" id="as-voice" style="margin-right:9px;">
+              <label for="as-voice" style="color:#b6ff90;font-size:0.94em;margin-right:18px;user-select:none; ">Ответить голосом</label>
+              <button id="chat-send" class="terminal-btn" type="button">отправить</button>
+              <button type="button" id="voice-btn" class="voice-btn" title="Говорить (удерживать)">🎤   Говорить</button>
+            </div>
+          </div>
+        </div>
+        <!-- Правая часть (дашборд) -->
+        <div id="right-block">
+          <div id="dashboard-title">Дашборд по аналитике запроса</div>
+          <div id="dashboard-content">
+            <div id="dashboard-empty">Аналитика...</div>
+          </div>
+        </div>
+      </div>
+      <div id="term-footer">
+        <div>О нас</div>
+        <div id="footer-links">
+          <a href="#">Публичный договор</a>
+          <a href="#">Политика конфиденциальности</a>
+        </div>
+        <div></div>
+      </div>
+    </div>
+    <!-- Login Modal -->
+    <div id="login-modal">
+      <form id="login-form" onsubmit="doLogin(event)">
+        <h2 style="margin-bottom: 2px; color: #A6FF59;">Вход для клиентов</h2>
+        <input id="login-input" placeholder="Email или телефон" autocomplete="username">
+        <input id="login-pass" type="password" placeholder="Пароль" autocomplete="current-password">
+        <button type="submit" class="terminal-btn">Войти</button>
+        <div id="login-error"></div>
+        <button type="button" onclick="closeLoginModal()" class="terminal-btn" style="background:rgba(44,99,  44,0.12);color:#A6FF59;box-shadow:none;width:90%;margin-top:12px;">Отмена</button>
+      </form>
+    </div>
+
+    <!-- FFmpeg.wasm для конвертации аудио -->
+    <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.10.1/dist/ffmpeg.min.js"></script>
+
+    <script>
+function initChat() {
+  // === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
+  let isLoggedIn = false;
+  const broadcastChannel = new BroadcastChannel('leadinc-auth');
+  const MAX_AUDIO_SECONDS = 120;
+
+  // === DOM Elements ===
+  const chatMsgs = document.getElementById('chat-messages');
+  const chatInput = document.getElementById('chat-input');
+  const chatSend = document.getElementById('chat-send');
+  const voiceBtn = document.getElementById('voice-btn');
+  const asVoice = document.getElementById('as-voice');
+  let activeSpinner = null;
+  let spinnerTimeout = null;
+
+  // ==== Универсальные утилиты ====
+  function blockChatInputs() {
+    chatInput.disabled = true;
+    chatSend.disabled = true;
+    voiceBtn.disabled = true;
+    asVoice.disabled = true;
+  }
+  function unblockChatInputs() {
+    chatInput.disabled = false;
+    chatSend.disabled = false;
+    voiceBtn.disabled = false;
+    asVoice.disabled = false;
+  }
+  function isMediaRecorderSupported() {
+    return typeof window.MediaRecorder !== "undefined";
+  }
+  function showSafariWarning() {
+    let warn = document.createElement('div');
+    warn.style = "color:#ffa64b;background:#202010;padding:15px 30px;border-radius:8px;font-size:1.04em;margin:14px 0;";
+    warn.innerHTML = "⚠️ Ваш браузер не поддерживает запись голоса (MediaRecorder API).<br>Попробуйте Google Chrome, Edge или Яндекс.Браузер.<br>Если вы используете iPhone, iPad или Mac — функция голосовых сообщений может быть недоступна.";
+    document.getElementById('chat-block').insertBefore(warn, document.getElementById('chat-input-row'));
+  }
+  if (!isMediaRecorderSupported()) showSafariWarning();
+
+  function setClientUI(loggedIn) {
+    isLoggedIn = loggedIn;
+    document.getElementById('logout-btn').style.display = loggedIn ? "inline-block" : "none";
+    document.getElementById('login-toggle-btn').style.display = loggedIn ? "none" : "inline-block";
+  }
+  function clearChatAndDashboard() {
+    chatMsgs.innerHTML = '';
+    clearDashboard();
+  }
+  function flashSuccess() {
+    let cont = document.getElementById('terminal');
+    cont.classList.add('flash-success');
+    setTimeout(() => cont.classList.remove('flash-success'), 1000);
+  }
+
+  // ==== Чат функционал ====
+  function appendMsg(role, text, withSpinner = false) {
+    let row = document.createElement('div');
+    row.className = "msg-row";
+    let msg = document.createElement('div');
+    msg.className = "msg " + role;
+    msg.innerText = '';
+    row.appendChild(msg);
+    row.style.justifyContent = role === "user" ? "flex-end" : "flex-start";
+    chatMsgs.appendChild(row);
+    let i = 0;
+    function print() {
+      if(i <= text.length) {
+        msg.innerText = text.slice(0,i);
+        i++; setTimeout(print, 6 + Math.random()*4);
+      }
+    }
+    print();
+    if (role === "assistant" && withSpinner) {
+      let spinner = document.createElement('span');
+      spinner.className = "assistant-spinner";
+      spinner.innerHTML = `<svg viewBox="0 0 38 38"><circle cx="19" cy="19" r="16" fill="none"/></svg>`;
+      msg.appendChild(spinner);
+      activeSpinner = spinner;
+    }
+    chatMsgs.scrollTop = chatMsgs.scrollHeight;
+  }
+  function removeSpinner() {
+    if(activeSpinner && activeSpinner.parentNode) {
+      activeSpinner.parentNode.removeChild(activeSpinner);
+      activeSpinner = null;
+    }
+  }
+  function playAssistantAudio(audioUrl, transcript = '') {
+    let row = document.createElement('div');
+    row.className = "msg-row";
+    let msg = document.createElement('div');
+    msg.className = "msg assistant";
+    msg.innerHTML = transcript ? transcript + "<br>" : "";
+    let player = document.createElement('audio');
+    player.controls = true;
+    player.className = 'audio-reply-player';
+    player.src = audioUrl;
+    player.type = "audio/mpeg";
+    msg.appendChild(player);
+    row.appendChild(msg);
+    chatMsgs.appendChild(row);
+    chatMsgs.scrollTop = chatMsgs.scrollHeight;
+  }
+  function renderDashboard(data) {
+    let db = document.getElementById('dashboard-content');
+    db.innerHTML = "";
+    if (!data || (!data.table && !data.analytics)) {
+      db.innerHTML = `<div id="dashboard-empty">Нет аналитики по текущему запросу.<br>Отправьте запрос по нише и региону, чтобы увидеть аналитику.</div>`;
+      return;
+    }
+    if (data.table && data.table.length) {
+      let cols = Object.keys(data.table[0]);
+      let table = document.createElement('table');
+      table.id = 'dashboard-table';
+      let thead = document.createElement('thead');
+      let trh = document.createElement('tr');
+      for (let col of cols) {
+        let th = document.createElement('th'); th.innerText = col;
+        trh.appendChild(th);
+      }
+      thead.appendChild(trh); table.appendChild(thead);
+      let tbody = document.createElement('tbody');
+      for (let row of data.table) {
+        let tr = document.createElement('tr');
+        for (let col of cols) {
+          let td = document.createElement('td'); td.innerText = row[col] ?? "";
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      db.appendChild(table);
+    }
+    if (data.analytics) {
+      let analytics = document.createElement('div');
+      analytics.id = "dashboard-analytics";
+      analytics.innerText = data.analytics;
+      db.appendChild(analytics);
+    }
+  }
+  function clearDashboard() { renderDashboard(null); }
+
+  function isSafari() {
+    return /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+  }
+
+  function sendMsg() {
+    let inp = chatInput;
+    let msg = inp.value.trim();
+    if(!msg) return;
+    let wantVoice = asVoice?.checked;
+    blockChatInputs();
+    appendMsg('user', msg);
+    inp.value = '';
+    chatMsgs.scrollTop = chatMsgs.scrollHeight;
+    appendMsg('assistant', 'Мозговой штурм нейронов запущен...', true);
+    if (spinnerTimeout) clearTimeout(spinnerTimeout);
+    spinnerTimeout = setTimeout(() => {
+      removeSpinner();
+      unblockChatInputs();
+    }, 45000);
+    let payload = { content: msg, type: "text" };
+    if(wantVoice) {
+      payload.answer_format = "voice";
+      if (isSafari()) {
+        payload.tts_format = "m4a";
+      }
+    }
+    fetch('/ai/chat', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }).then(resp => resp.json()).then(data => {
+      removeSpinner();
+      let reply = data.reply || '[Нет ответа]';
+      if(data.reply_type === 'voice' && data.audio_url) {
+        playAssistantAudio(data.audio_url, data.text_transcript || '');
+      } else {
+        appendMsg('assistant', reply);
+      }
+      if(data.dashboard) renderDashboard(data.dashboard);
+      if(data.meta && data.meta.stage === 4) {
+        setClientUI(true); flashSuccess();
+        broadcastChannel.postMessage('login');
+      }
+      if(data.meta && data.meta.stage && data.meta.stage !== 4 && data.meta.error) {
+        appendMsg('assistant', `[Ошибка: ${data.meta.error}]`);
+      }
+    }).catch(() => {
+      removeSpinner();
+      appendMsg('assistant', "[Ошибка: нет связи с сервером]");
+    }).finally(() => {
+      if (spinnerTimeout) clearTimeout(spinnerTimeout);
+      unblockChatInputs();
+      chatInput.focus();
+    });
+  }
+
+  chatSend.onclick = sendMsg;
+  chatInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      sendMsg();
+    }
+  });
+
+  // ========== ГОЛОСОВОЕ СООБЩЕНИЕ + КОНВЕРТАЦИЯ ==========
+  let mediaRecorder, audioChunks = [], audioStartTime = 0, audioTimer = null;
+  let ffmpegReady = false;
+  let ffmpeg, createFFmpeg, fetchFile;
+  function stopIfDisabled() {
+    return chatInput.disabled || chatSend.disabled || voiceBtn.disabled || asVoice.disabled;
+  }
+  voiceBtn.addEventListener('mousedown', function(e){ if (!stopIfDisabled()) startRecording(e); });
+  voiceBtn.addEventListener('touchstart', function(e){ if (!stopIfDisabled()) startRecording(e); });
+  voiceBtn.addEventListener('mouseup', stopRecording);
+  voiceBtn.addEventListener('mouseleave', stopRecording);
+  voiceBtn.addEventListener('touchend', stopRecording);
+
+  function startRecording(e) {
+    e.preventDefault();
+    if (mediaRecorder && mediaRecorder.state === "recording") return;
+    if (!isMediaRecorderSupported()) {
+      alert("Голосовые сообщения недоступны: не поддерживается вашим браузером.");
+      return;
+    }
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+      mediaRecorder = new MediaRecorder(stream);
+      audioChunks = [];
+      mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+      mediaRecorder.onstop = sendAudioMessage;
+      mediaRecorder.start();
+      voiceBtn.classList.add('recording');
+      voiceBtn.textContent = '🔴 Говорите...';
+      audioStartTime = Date.now();
+      blockChatInputs();
+      audioTimer = setInterval(() => {
+        const seconds = Math.floor((Date.now() - audioStartTime) / 1000);
+        if (seconds >= MAX_AUDIO_SECONDS) {
+          stopRecording();
+        }
+      }, 500);
+    }).catch(() => {
+      alert('Нет доступа к микрофону');
+    });
+  }
+
+  function stopRecording(e) {
+    if (!mediaRecorder || mediaRecorder.state !== "recording") return;
+    mediaRecorder.stop();
+    voiceBtn.classList.remove('recording');
+    voiceBtn.textContent = '🎤 Говорить';
+    if(audioTimer) { clearInterval(audioTimer); audioTimer = null; }
+  }
+
+  function ensureFFmpegLibs() {
+    if (typeof window.FFmpeg === "undefined") {
+      alert("FFmpeg.wasm не загружен. Проверь ссылку на CDN!");
+      throw new Error("FFmpeg.wasm не загружен.");
+    }
+    if (!createFFmpeg) {
+      createFFmpeg = window.FFmpeg.createFFmpeg;
+      fetchFile = window.FFmpeg.fetchFile;
+      ffmpeg = createFFmpeg({ log: false });
+    }
+  }
+  async function ensureFFmpegReady() {
+    ensureFFmpegLibs();
+    if (!ffmpegReady) {
+      await ffmpeg.load();
+      ffmpegReady = true;
+    }
+  }
+  async function sendAudioMessage() {
+    appendMsg('user', '[Голосовое сообщение]');
+    appendMsg('assistant', 'Мозговой штурм нейронов запущен...', true);
+    try {
+      await ensureFFmpegReady();
+    } catch (err) {
+      removeSpinner();
+      unblockChatInputs();
+      appendMsg('assistant', '[Ошибка: FFmpeg.wasm не доступен]');
+      return;
+    }
+    try {
+      const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+      ffmpeg.FS('writeFile', 'input.webm', await fetchFile(audioBlob));
+      await ffmpeg.run('-i', 'input.webm', '-vn', '-ar', '44100', '-ac', '2', '-b:a', '128k', 'output.mp3');
+      const mp3Data = ffmpeg.FS('readFile', 'output.mp3');
+      const mp3Blob = new Blob([mp3Data.buffer], { type: 'audio/mpeg' });
+      let formData = new FormData();
+      formData.append('audio', mp3Blob, 'voice-message.mp3');
+      formData.append('type', 'voice');
+      ffmpeg.FS('unlink', 'input.webm');
+      ffmpeg.FS('unlink', 'output.mp3');
+      fetch('/ai/chat', {
+        method: 'POST',
+        credentials: 'include',
+        body: formData
+      }).then(resp => resp.json()).then(data => {
+        removeSpinner();
+        if(data.reply_type === 'voice' && data.audio_url) {
+          playAssistantAudio(data.audio_url, data.text_transcript || '');
+        } else {
+          appendMsg('assistant', data.reply || '[Нет ответа]');
+        }
+        if(data.dashboard) renderDashboard(data.dashboard);
+      }).catch(() => {
+        removeSpinner();
+        appendMsg('assistant', "[Ошибка: нет связи с сервером]");
+      }).finally(() => {
+        unblockChatInputs();
+      });
+    } catch (err) {
+      removeSpinner();
+      unblockChatInputs();
+      appendMsg('assistant', '[Ошибка конвертации: ' + err.message + ']');
+    }
+  }
+
+  // === Авторизация и BroadcastChannel ===
+  async function checkAuthStatus(onload = false) {
+    try {
+      let resp = await fetch('/auth/users/me', { credentials: 'include' });
+      if (resp.ok) {
+        setClientUI(true);
+        if (onload && chatMsgs.children.length === 0) {
+          appendMsg('assistant', 'Привет! Я ваш AI-менеджер Leadinc, чем могу помочь?');
+        }
+      } else {
+        setClientUI(false);
+        if (onload && chatMsgs.children.length === 0) {
+          appendMsg('assistant', 'Привет! Я ваш AI-менеджер Leadinc. Вход необязателен, но даёт доступ к расширенным возможностям!');
+        }
+      }
+    } catch {
+      setClientUI(false);
+      if (onload && chatMsgs.children.length === 0) {
+        appendMsg('assistant', 'Привет! Я ваш AI-менеджер Leadinc. Нет связи с сервером.');
+      }
+    }
+  }
+  
+  broadcastChannel.onmessage = (event) => {
+    if (event.data === 'logout') {
+      setClientUI(false);
+      clearChatAndDashboard();
+      appendMsg('assistant', 'Вы вышли из аккаунта (сессия завершена во всех окнах).');
+    }
+    if (event.data === 'login') {
+      setClientUI(true);
+      appendMsg('assistant', 'Вы вошли как клиент (во всех вкладках).');
+    }
+  };
+  
+  document.getElementById('logout-btn').onclick = async function() {
+    try { await fetch('/auth/jwt/logout', { method: 'POST', credentials: 'include' }); } catch {}
+    document.cookie = "sessionid=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; Secure; SameSite=Lax";
+    document.cookie = "fastapiusersauth=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; Secure; SameSite=Strict";
+    window.location.reload();
+    setClientUI(false);
+    clearChatAndDashboard();
+    appendMsg('assistant', 'Вы вышли из аккаунта. Чат продолжает работать в гостевом режиме.');
+    broadcastChannel.postMessage('logout');
+  };
+  
+  // Глобальные функции для модального окна
+  window.openLoginModal = function() {
+    document.getElementById('login-modal').classList.add('active');
+    document.getElementById('login-error').textContent = '';
+    document.getElementById('login-input').focus();
+  }
+  
+  window.closeLoginModal = function() {
+    document.getElementById('login-modal').classList.remove('active');
+    document.getElementById('login-error').textContent = '';
+  }
+  
+  window.doLogin = async function(e) {
+    e.preventDefault();
+    let login = document.getElementById('login-input').value.trim();
+    let pass = document.getElementById('login-pass').value;
+    let err = document.getElementById('login-error');
+    err.textContent = "";
+    try {
+      let resp = await fetch('/auth/jwt/login_custom', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: login, password: pass }),
+        credentials: 'include'
+      });
+      let data = await resp.json();
+      if (resp.ok && data.token) {
+        setClientUI(true);
+        document.getElementById('login-modal').classList.remove('active');
+        flashSuccess();
+        appendMsg('assistant', 'Вы вошли как клиент. Доступ открыт к расширенному функционалу!');
+        broadcastChannel.postMessage('login');
+      } else {
+        if (typeof data.detail === 'string') {
+            err.textContent = data.detail;
+        } else if (Array.isArray(data.detail)) {
+            err.textContent = data.detail.map(e => e.msg || JSON.stringify(e)).join(', ');
+        } else if (data.error) {
+            err.textContent = data.error;
+        } else {
+            err.textContent = JSON.stringify(data);
+        }
+      }
+    } catch (e) {
+      err.textContent = "Нет соединения с сервером";
+    }
+  };
+
+  // Запуск проверки авторизации при загрузке
+  checkAuthStatus(true);
+}
+
+// === ГЛАВНЫЙ ЗАПУСК ===
+window.addEventListener('DOMContentLoaded', initChat);
+    </script>
+</body>
+</html>
