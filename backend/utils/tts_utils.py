@@ -26,7 +26,7 @@ from backend.utils.audio_constants import (
     TTS_SOFT_TIME_LIMIT,
     TTS_HARD_TIME_LIMIT,
     DEFAULT_TTS_FORMAT,
-    TTS_FORMAT_MAP
+    TTS_FORMAT_MAP,
     TTS_RETRY_COUNT,
     AUDIO_FORMAT,
     OGG_FORMAT,

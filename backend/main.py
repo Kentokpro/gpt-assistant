@@ -26,6 +26,7 @@ from backend.tasks.stt import stt_task
 from backend.tasks.tts import tts_task
 from backend.utils.stt_utils import save_upload_file
 from celery.result import AsyncResult
+from backend.utils.audio_constants import SUPPORTED_TTS_FORMATS
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -456,25 +457,27 @@ async def chat(
     answer_format = payload.get("answer_format")  # может быть None
 
     content_lower = content.lower() if isinstance(content, str) else ""
+    logger.warning(f"[DEBUG][PAYLOAD] content={content!r}, msg_type={msg_type}, answer_format={answer_format}, payload={payload}")
 
     # --- Определяем, просит ли пользователь текст/войс через триггеры ---
     is_voice_trigger = any(trigger in content_lower for trigger in VOICE_TRIGGER_PHRASES)
     is_text_trigger = any(trigger in content_lower for trigger in TEXT_TRIGGER_PHRASES)
+    logger.warning(f"[DEBUG][TRIGGERS] is_voice_trigger={is_voice_trigger}, is_text_trigger={is_text_trigger}")
 
     # --- Логика выбора формата ответа строго по чек-листу ---
-
     if msg_type == "voice" and (answer_format == "text" or is_text_trigger):
-        # Пользователь прислал ВОЙС и ЯВНО ПРОСИТ ТЕКСТ — выдаём только текст
         answer_format = "text"
+        logger.warning(f"[DEBUG][BRANCH] msg_type=voice, but text trigger or answer_format=text =>  answer_format=text")
     elif msg_type == "voice":
-        # Пользователь прислал ВОЙС (без просьбы о тексте) — выдаём только войс
         answer_format = "voice"
+        logger.warning(f"[DEBUG][BRANCH] msg_type=voice, no text trigger => answer_format=voice")
     elif answer_format == "voice" or is_voice_trigger:
-        # Пользователь прислал ТЕКСТ и ЯВНО просит голос — выдаём только войс
         answer_format = "voice"
+        logger.warning(f"[DEBUG][BRANCH] answer_format=voice or voice trigger =>    answer_format=voice")
     else:
-        # В остальных случаях — только текст
         answer_format = "text"
+        logger.warning(f"[DEBUG][BRANCH] default fallback => answer_format=text")
+
     logger.info(f"[PAYLOAD] content={content!r}, msg_type={msg_type}, answer_format={answer_format}")
 
 
@@ -1068,9 +1071,10 @@ async def chat(
 
         # --- Централизованный return ответа ассистента (строго по answer_format) ---
         if answer_format == "voice":
+            logger.warning(f"[DEBUG][TTS ENTRY] answer_format=voice, about to call TTS! reply={reply[:60]}")
             # Генерируем войс через TTS (Celery)
             tts_format = payload.get("tts_format", "mp3")
-            if tts_format not in supported_formats:
+            if tts_format not in SUPPORTED_TTS_FORMATS:
                 logger.warning(f"[VOICE] Некорректный tts_format '{tts_format}', принудительно mp3")
                 tts_format = "mp3"
             logger.info(f"[VOICE] Выбран формат TTS: {tts_format}")
@@ -1090,6 +1094,7 @@ async def chat(
                         "meta": tts_result.get("meta", {}),
                     }
                 else:
+                    logger.warning(f"[DEBUG][TTS FAIL] tts_result error or audio_url missing: {tts_result}")
                     response_payload = {
                         "reply_type": "voice",
                         "audio_url": None,
@@ -1117,6 +1122,7 @@ async def chat(
                     }
                 }
         else:
+            logger.warning(f"[DEBUG][NO TTS] answer_format={answer_format}, TTS не вызывается, ответ текстом.")
             response_payload = {
                 "reply_type": "text",
                 "reply": reply,

@@ -35,7 +35,7 @@ STT_HARD_TIME_LIMIT = 60     # лимит времени для задачи STT
 MAX_AUDIO_DURATION_SEC = 120   # 2 минуты
 
 # --- Максимальный размер аудиофайла (МБ) ---
-MAX_AUDIO_SIZE_MB = 10         # 15 мегабайт
+MAX_AUDIO_SIZE_MB = 15         # 15 мегабайт
 
 # --- Количество попыток воркера ---
 TTS_RETRY_COUNT = 3
