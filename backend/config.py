@@ -2,9 +2,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-BASE_DIR = Path(__file__).resolve().parent
-
-env_path = BASE_DIR / ".env.backend"
+env_path = Path("/root/ai-assistant/backend/.env.backend")
 if env_path.exists():
     load_dotenv(dotenv_path=env_path)
 else:
@@ -53,3 +51,8 @@ GA_MEASUREMENT_ID = os.getenv("GA_MEASUREMENT_ID")
 METRIKA_ID = os.getenv("METRIKA_ID")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+
+FAQ_COLLECTION_NAME = os.getenv("FAQ_COLLECTION_NAME", "faq_leadinc")
+ANALYTICS_COLLECTION_NAME = os.getenv("ANALYTICS_COLLECTION_NAME", "analytics_leadinc")
+print("FAQ_COLLECTION_NAME:", FAQ_COLLECTION_NAME)              # ВРЕМЕННО ДЛЯ ТЕСТА, УДАЛИТЬ 
+print("ANALYTICS_COLLECTION_NAME:", ANALYTICS_COLLECTION_NAME)  # ВРЕМЕННО ДЛЯ ТЕСТА, УДАЛИТЬ 

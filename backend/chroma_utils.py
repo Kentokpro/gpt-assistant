@@ -5,6 +5,12 @@ import os
 import aiofiles
 import asyncio
 import re
+from backend.config import ANALYTICS_COLLECTION_NAME, FAQ_COLLECTION_NAME
+from backend.config import CHROMA_HOST, CHROMA_PORT
+from chromadb.config import Settings
+
+CHROMA_SETTINGS = Settings(anonymized_telemetry=False)
+client = chromadb.Client(CHROMA_SETTINGS)
 
 # Настройка логирования
 logger = logging.getLogger("leadinc-chroma")
@@ -14,8 +20,6 @@ if not logger.hasHandlers():
     handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s [chroma_utils] %(message)s'))
     logger.addHandler(handler)
 
-CHROMA_HOST = "localhost"
-CHROMA_PORT = 8001
 ARTICLES_FILE = "/root/ai-assistant/leadinc_Вопрос_ответ_готовый/FAQ_Leadinc.md"
 
 def connect_to_chromadb() -> chromadb.HttpClient:
@@ -40,7 +44,7 @@ def get_collection(collection_name: str):
 async def search_chunks_by_embedding(
     query_emb: List[float],
     n_results: int = 5,
-    collection_name: str = "faq_leadinc",
+    collection_name: str = FAQ_COLLECTION_NAME,
     filters: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
     """
@@ -78,7 +82,7 @@ async def search_chunks_by_embedding(
     return await loop.run_in_executor(None, do_search)
 
 async def filter_chunks(
-    collection_name: str = "faq_leadinc",
+    collection_name: str = FAQ_COLLECTION_NAME,
     article_id: Optional[str] = None,
     meta_tags: Optional[str] = None,
     tags: Optional[str] = None,
