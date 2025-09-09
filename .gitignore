@@ -33,6 +33,7 @@ leadinc_Вопрос_ответ_готовый/
 *.md
 *.json
 chroma_data_analytics
+chroma_data_faq/
 raw_data/
 
 # Виртуальные окружения

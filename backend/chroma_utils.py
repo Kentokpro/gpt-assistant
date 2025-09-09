@@ -1,3 +1,4 @@
+
 import chromadb
 import logging
 from typing import Optional, List, Dict, Any
@@ -24,8 +25,12 @@ ARTICLES_FILE = "/root/ai-assistant/leadinc_Вопрос_ответ_готовы
 
 def connect_to_chromadb() -> chromadb.HttpClient:
     try:
-        client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
-        logger.debug("ChromaDB client создан успешно.")
+        client = chromadb.HttpClient(
+            host=CHROMA_HOST,
+            port=CHROMA_PORT,
+            settings=Settings(anonymized_telemetry=False)  # <- ВАЖНО
+        )
+        logger.debug("ChromaDB HttpClient создан успешно (telemetry=disabled).")
         return client
     except Exception as e:
         logger.error(f"Ошибка подключения к ChromaDB: {e}")
@@ -53,28 +58,42 @@ async def search_chunks_by_embedding(
     """
     loop = asyncio.get_event_loop()
 
+    def normalize_tags(v):
+        # Приводит tags/meta_tags к удобному виду: list -> list, str -> [str], None -> []
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        return [str(v)]
+
     def do_search():
         collection = get_collection(collection_name)
+        
         try:
+            internal_k = max(int(n_results or 5), 12)
             result = collection.query(
                 query_embeddings=[query_emb],
-                n_results=n_results,
-                where=filters if filters else None
+                n_results=internal_k,
+                where=filters if filters else None,
+                include=["documents", "metadatas", "distances"]
             )
-            docs = result.get("documents", [[]])[0]
-            metas = result.get("metadatas", [[]])[0]
+            
+            docs  = (result.get("documents")  or [[]])[0] or []
+            metas = (result.get("metadatas")  or [[]])[0] or []
             enriched = []
             for doc, meta in zip(docs, metas):
+                article_id = (meta or {}).get("article_id", "unknown")
                 enriched.append({
-                    "article_id": meta.get("article_id", "unknown"),
-                    "title": meta.get("title", ""),
-                    "meta_tags": meta.get("meta_tags", ""),
-                    "tags": meta.get("tags", []),
-                    "summary": meta.get("summary", ""),
-                    "text": doc
+                    "article_id": article_id,
+                    "title": (meta or {}).get("title", "") or "",
+                    "meta_tags": (meta or {}).get("meta_tags", "") or "",
+                    "tags": normalize_tags((meta or {}).get("tags")),
+                    "summary": (meta or {}).get("summary", "") or "",
+                    "text": doc or ""
                 })
-            logger.info(f"Поиск по базе '{collection_name}', найдено: {len(enriched)}")
-            return enriched
+            out = enriched[: int(n_results or 5)]
+            logger.info(f"Поиск по базе '{collection_name}', запрошено={n_results}, internal_k={internal_k}, возвращаем={len(out)}")
+            return out
         except Exception as e:
             logger.error(f"Ошибка поиска в ChromaDB: {e}")
             raise

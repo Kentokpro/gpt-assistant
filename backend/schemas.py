@@ -212,8 +212,13 @@ class LeadRequest(BaseModel):
 
 class UserRead(BaseModel):
     id: UUID
+    login: Optional[str] = None
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+
     created_at: Optional[datetime]
     updated_at: Optional[datetime]
+
     model_config = ConfigDict(from_attributes=True)
 
 class UserCreate(BaseModel):

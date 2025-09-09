@@ -1,12 +1,10 @@
-
 """
-Leadinc AI Backend — полный рефакторинг (2025-08)
-- Мягкая валидация через OpenAI-ассистента
-- DEV ONLY: временный вывод логина/пароля через чат
-- Управление этапами через ассистента, backend валидирует только переходы и защищает от скачков
-- Подробное логирование всех ключевых событий
-- Защита stage, нет дублей логики, правила валидации только в prompt
-- После авторизации stage не может быть <4, код и регистрацию не спрашиваем
+Leadinc AI Backend — полный рефакторинг (2025-2.09)
+- Валидация через OpenAI-ассистента.
+- DEV ONLY: временный вывод логина/пароля через чат.
+- Управление этапами при регистрации через ассистента, backend валидирует переходы и дополнительно защищает от скачков.
+- Подробное логирование всех ключевых событий.
+- После авторизации stage не может быть <4.
 - Автоочистка неактуальных ключей Redis после регистрации (5 дней)
 """
 
@@ -22,8 +20,7 @@ from fastapi import Body
 import json
 import uuid
 import time
-import re
-import os
+import random, re, unicodedata, os
 
 from backend.tasks.stt import stt_task
 from backend.tasks.tts import tts_task
@@ -41,7 +38,7 @@ from backend.auth import get_user_manager
 from backend.utils.passwords import generate_password
 from fastapi_users.password import PasswordHelper
 from backend.models import Session as SessionModel
-from backend.chroma_utils import filter_chunks, search_chunks_by_embedding
+from backend.chroma_utils import filter_chunks, search_chunks_by_embedding, get_full_article
 
 from backend.auth import (
     fastapi_users, auth_backend, require_active_subscription, current_active_user_optional, get_jwt_strategy
@@ -157,10 +154,10 @@ from backend.config import (
     DEBUG, LOG_LEVEL, ADMIN_EMAIL, GA_MEASUREMENT_ID, METRIKA_ID, SUPPORT_EMAIL, SESSION_COOKIE_NAME, FAQ_COLLECTION_NAME, ANALYTICS_COLLECTION_NAME
 )
 
-# Превратим LOG_LEVEL в числовой
+# Числовой LOG_LEVEL
 LEVEL = logging.getLevelName(str(LOG_LEVEL).upper())
 if not isinstance(LEVEL, int):
-    LEVEL = logging.INFO  # дефолт на всякий случай
+    LEVEL = logging.INFO
 
 logging.basicConfig(
     level=LEVEL,
@@ -183,7 +180,6 @@ engine = create_async_engine(
 )
 
 # === 3. Куки, сессии и утилиты ===
-
 def set_session_cookie(response: Response, session_id: str):
     response.set_cookie(
         key="sessionid",
@@ -214,6 +210,23 @@ def ten_minutes_ago():
 
 def five_days():
     return 5 * 24 * 60 * 60
+
+# утилита генератор логина из города/ниши
+def generate_login_from_city_niche(city: str, niche: str) -> str:
+    # Нормализует и чистит строку (только буквы/цифры, нижний регистр)
+    def _slug(x: str) -> str:
+        x = unicodedata.normalize("NFKD", (x or "").lower())
+        return re.sub(r"[^a-zа-я0-9]+", "", x)
+
+    s_city = _slug(city)
+    s_niche = _slug(niche)
+
+    # Берёт первые 4 символа города + первые 4 символа ниши
+    base = (s_city[:4] or "usr") + (s_niche[:4] or "biz")
+
+    # Добавляет 4 случайные цифры
+    suffix = f"{random.randint(0, 9999):04d}"
+    return f"{base}{suffix}"
 
 # === 4. FastAPI App и Middleware ===
 app = FastAPI(
@@ -274,6 +287,7 @@ async def get_current_user(user=Depends(current_active_user_optional)):
     return {
         "is_authenticated": True,
         "id": str(user.id),
+        "login": getattr(user, "login", None),
         "email": user.email,
         "phone": user.phone
     }
@@ -290,7 +304,7 @@ async def login_custom(
     if not session_id:
         session_id = str(uuid.uuid4())
     result = await db.execute(
-        select(User).where((User.email == username) | (User.phone == username))
+        select(User).where(User.login == username)
     )
     user = result.scalar_one_or_none()
     if user is None:
@@ -303,7 +317,7 @@ async def login_custom(
 
     jwt_strategy = get_jwt_strategy()
     token = await jwt_strategy.write_token(user)
-    response = JSONResponse({"token": token, "email": user.email, "phone": user.phone})
+    response = JSONResponse({"token": token, "login": user.login, "email": user.email, "phone": user.phone})
     response = set_session_cookie(response, session_id)
     response.set_cookie(
         key="fastapiusersauth",
@@ -338,11 +352,6 @@ STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 app.include_router(
-    fastapi_users.get_auth_router(auth_backend),
-    prefix="/auth/jwt",
-    tags=["auth"],
-)
-app.include_router(
     fastapi_users.get_register_router(
         user_schema=UserRead,
         user_create_schema=UserCreate
@@ -354,11 +363,11 @@ app.include_router(
 ai_router = APIRouter(prefix="/ai", tags=["ai"])
 
 # === 5. Ограничения и лимиты ===
-MESSAGE_LIMITS = [500, 500, 500]
+MESSAGE_LIMITS = [150, 150, 150]
 PROJECT_LIMIT_PER_DAY = 10
-USER_LIMIT = 500
+USER_LIMIT = 150
 
-# === 6. Основной AI endpoint — ЛОГИКА СЦЕНАРИЯ/СТАДИЙ ===
+# === 6. Основной AI endpoint ===
 @ai_router.post("/chat")
 async def chat(
     request: Request,
@@ -391,6 +400,8 @@ async def chat(
     new_stage = stage
     stage_out = stage
     emit_stage = False
+
+    ai_response_post = {}
 
     phone_redis = None
     email_redis = None
@@ -493,7 +504,6 @@ async def chat(
     is_text_trigger = any(trigger in content_lower for trigger in TEXT_TRIGGER_PHRASES)
     logger.info(f"[ОТЛАДКА] Триггеры: голос={is_voice_trigger}, текст={is_text_trigger}")
 
-
     # --- Логика выбора формата ответа ---
     if msg_type == "voice" and (answer_format == "text" or is_text_trigger):
         answer_format = "text"
@@ -520,39 +530,22 @@ async def chat(
         existing = result.scalar_one_or_none()
         if not existing:
             db.add(SessionModel(id=session_id))
-            await db.flush()  # [OK]
+            await db.flush()
         logger.info(f"SessionModel for {session_id}: {'created' if not existing else 'exists'}")
 
-        # --- 1. Память для AI: phone/email в Redis ---
-        phone_redis = await redis.get(f"reg_phone:{session_id}")
-        email_redis = await redis.get(f"reg_email:{session_id}")
+        # --- 1. Память для AI: reg_city/reg_niche в Redis ---
+        city_redis  = await redis.get(f"reg_city:{session_id}")
+        niche_redis = await redis.get(f"reg_niche:{session_id}")
 
         # --- 2. Определение этапа (stage) ---
         if user:
-            stage = 4
+            stage = 3
             await redis.set(stage_key, stage, ex=12 * 60 * 60)
-            logger.info(f"User is authorized. Forcing stage=4 for user_id={user.id}, session={session_id}")
-
+            logger.info(f"User is authorized. Forcing stage=3 for user_id={user.id}, session={session_id}")
 
         # --- 3. Лимиты, спам, guest limits ---
         lim_prefix = f"{user.id}" if user else session_id
         msg_count_key = f"msg_count:{lim_prefix}"
-        msg_count = int(await redis.get(msg_count_key) or 0)
-
-        # === Мотивация регистрации — только 1 раз за сессию на 10-м сообщении гостя ===
-        if not user and msg_count == 10 and not await redis.get(f"motivation_shown:{session_id}"):
-            await redis.set(f"motivation_shown:{session_id}", 1, ex=12*60*60)
-            return set_session_cookie(JSONResponse({
-                "reply": (
-                    "Дарим подарки первым пользователям в честь запуска!"
-                    "Зарегистрируйся сейчас и получи 10 бесплатных лидов!\n\n"
-                ),
-                "meta": {
-                    "stage": stage,
-                    "reason": "motivate_register",
-                    "msg_count": msg_count
-                }
-            }), session_id)
         
         # Flood protection (гостям)
         if not user:
@@ -581,8 +574,17 @@ async def chat(
                 "meta": {"stage": stage, "reason": "ip_ban"}
             }), session_id)
 
-        await redis.incr(msg_count_key)
+        msg_count = await redis.incr(msg_count_key)
         await redis.expire(msg_count_key, 600)
+
+        total_key = f"msg_total_count:{lim_prefix}"
+        total_msgs = await redis.incr(total_key)
+        await redis.expire(total_key, 12 * 60 * 60) 
+
+        # На 9-м сообщении гостя появиться флаг для LLM "добавь бонус"
+        if (not user) and (total_msgs >= 9) and not await redis.get(f"promo_offered:{session_id}"):
+            await redis.set(f"promo_inject:{session_id}", 1, ex=12 * 60 * 60)     # флаг для LLM (1 раз)
+            await redis.set(f"promo_offered:{session_id}", 1, ex=7 * 24 * 60 * 60)
 
         # --- 4. Лимиты пользователей ---
         if user:
@@ -620,7 +622,7 @@ async def chat(
         # --- [БЛОК] Обработка коротких подтверждений пользователя для выдачи полной статьи ---
         # 1. короткие подтверждения — только целые слова
         CONFIRM_WORDS = {
-            "да","ок","окей","ага","угу","yes","sure", "давай", "дальше", "ещё", "еще", "продолжи", "продолжай", "погнали", "расскажи", "подробнее", "поясни", "больше", "полную", "полностью", "весь", "всю", "развёрнуто", "расширь", "давайте",
+            "да","ок","окей","ага","угу","хочу","sure", "давай", "дальше", "ещё", "еще", "продолжи", "продолжай", "погнали", "расскажи", "подробнее", "поясни", "больше", "полную", "полностью", "весь", "всю", "развёрнуто", "расширь", "давайте",
             "да, давай", "давай полностью", "расскажи дальше", "расскажи полностью", "полный текст", "покажи всё", "расскажи до конца", "да, интересно",  "ещё расскажи","расширенно", "расширенный ответ", "весь текст","больше","продолжай","продолжи", "да, интересно", "да, хочу", "хочу больше", "расскажи все", "расскажи всё",
         }
         
@@ -628,7 +630,7 @@ async def chat(
             t = (txt or "").strip().lower()
             if t in CONFIRM_WORDS:
                 return True
-            # Допускаем частые формы подтверждения без строгого совпадения
+            # Допускаются частые формы подтверждения без строгого совпадения
             return t.startswith("да") or t.startswith("ок") or t in {"ок","окей","ага","угу","yes","sure", "давай", "дальше", "ещё", "еще", "продолжи", "продолжай", "погнали", "расскажи", "подробнее", "поясни", "больше"}
 
         # Хранилище последней статьи FAQ по сессии
@@ -636,27 +638,56 @@ async def chat(
         FAQ_LAST_SCENARIO_KEY = f"last_ai_scenario:{session_id}"
 
         async def _faq_load_by_id(aid: str) -> tuple[str, str]:
-            # Вернуть (title, full_text) для article_id или пустые строки, если не найдено.
-            chunks = await filter_chunks(article_id=aid)
-            if not chunks:
-                logger.warning(f"[FAQ][ПОИСК] Не удалось найти статью по article_id={aid}")
+            """
+            Получает заголовок и полный текст статьи для confirm.
+            1 Пробует по Chroma (быстро).
+            2 Если не найдено или 'text' пустой — фолбэк на markdown-файл через get_full_article().
+            """
+            # 1. Быстрая попытка через Chroma
+            try:
+                chunks = await filter_chunks(article_id=str(aid))
+            except Exception as e:
+                logger.warning(f"[FAQ][_faq_load_by_id] Chroma error for aid={aid}: {e}")
+                chunks = []
+
+            title = ""
+            full_text = ""
+            if chunks:
+                title = (chunks[0].get("title") or "").strip()
+                full_text = (chunks[0].get("text") or "").strip()
+
+            # 2. Фолбэк: markdown-файл с полным текстом
+            if not full_text:
+                try:
+                    md = await get_full_article(str(aid))
+                    if md and isinstance(md, str) and md.strip():
+                        full_text = md.strip()
+                        if not title:
+                            # если заголовка нет — оставляем пустым; LLM сам сформулирует
+                            title = ""
+                        logger.info(f"[FAQ][ПОИСК] Fallback markdown для article_id={aid} — OK, len={len(full_text)}")
+                    else:
+                        logger.warning(f"[FAQ][ПОИСК] Fallback markdown пуст для article_id={aid}")
+                except Exception as e:
+                    logger.warning(f"[FAQ][ПОИСК] Ошибка fallback get_full_article({aid}): {e}")
+
+            if not full_text:
+                logger.warning(f"[FAQ][ПОИСК] Не удалось получить текст статьи article_id={aid}")
                 return "", ""
-            title = chunks[0].get("title") or ""
-            full_text = chunks[0].get("text") or ""
-            logger.info(f"[FAQ][ПОИСК] Успешно найдено: article_id={aid}, заголовок='{title[:80]}'")
             return title, full_text
 
         user_input = (content or "")
         user_input_norm = user_input.strip().lower()
         confirm_hit = is_confirm_trigger(user_input_norm)
 
-        # Читаем из Redis, что мы отдавали в прошлый раз
+        # Читаем из Redis, что отдавалось в прошлый раз
         last_aid = await redis.get(FAQ_LAST_AID_KEY) or ""
         last_scenario = await redis.get(FAQ_LAST_SCENARIO_KEY) or ""       
         logger.info(f"[FAQ] Прочитали состояние: last_article_id={last_aid!r}, last_scenario={last_scenario!r}")
 
         faq_context = None
         faq_article_id = None
+        single_pass_context = {}
 
         if confirm_hit and last_scenario and last_scenario.upper() == "FAQ":
             logger.info("[FAQ][CONFIRM] Получен confirm-триггер в сценарии FAQ")
@@ -675,7 +706,26 @@ async def chat(
         if faq_context:
             logger.info(f"[FAQ] Готов контекст статьи для LLM: article_id={faq_article_id!r}")
         else:
+            if last_aid:
+                single_pass_context["faq_last_article_id"] = last_aid
             logger.info("[FAQ] Confirm-контекст отсутствует — решение за LLM (router/поиск через tools).")
+
+        # Проброс флагов/данных в контекст для LLM
+        single_pass_context.setdefault("flags", {})
+        if await redis.get(f"promo_inject:{session_id}"):
+            single_pass_context["flags"]["promo_inject"] = True
+            # одноразовый впрыск
+            await redis.delete(f"promo_inject:{session_id}")
+
+        reg_city_ctx = await redis.get(f"reg_city:{session_id}")
+        reg_niche_ctx = await redis.get(f"reg_niche:{session_id}")
+        if reg_city_ctx:
+            single_pass_context["reg_city"] = reg_city_ctx
+        if reg_niche_ctx:
+            single_pass_context["reg_niche"] = reg_niche_ctx
+
+        if await redis.get(f"postreg_offer_analytics:{session_id}"):
+            single_pass_context["flags"]["postreg_offer_analytics"] = True
 
         # --- B. Сохраняем сообщение пользователя ---
         try:
@@ -693,21 +743,17 @@ async def chat(
         except Exception as e:
             logger.error(f"DB error while saving user message: {str(e)}")
 
-
-# 1. Назначение: сократить летучую память истории для LLM.
-# 2. Изменение: limit(3) вместо limit(10); чистка, если >3 (было >10).
-# 3. Причина: снизить расход токенов и «прилипчивость» контекста.
+        # летучая память LLM. Помнит последние 10 сообщений, то что выше удаляется.
         messages_for_gpt = []
         q = (
             select(Message)
             .where(Message.session_id == session_id)
             .order_by(Message.created_at.desc())
-            .limit(3)   # было .limit(10)
+            .limit(10)
         )
         result = await db.execute(q)
         msgs_keep = result.scalars().all()[::-1]  # старые сообщения в начало
 
-        messages_for_gpt = []
         for m in msgs_keep:
             payload = {"role": m.role, "content": m.content}
             if m.role == "assistant":
@@ -731,22 +777,20 @@ async def chat(
         )
         result_all = await db.execute(q_all)
         all_msgs = result_all.scalars().all()
-        if len(all_msgs) > 3:   # было > 10
+        if len(all_msgs) > 10:
             ids_keep = set(msg.id for msg in msgs_keep)
             ids_del = [msg.id for msg in all_msgs if msg.id not in ids_keep]
             if ids_del:
                 await db.execute(
                     Message.__table__.delete().where(Message.id.in_(ids_del))
                 )
-        messages_for_gpt = [{"role": msg.role, "content": msg.content} for msg in msgs_keep]
 
-        # Собираем контекст для confirm (если был)
-        single_pass_context = {}
+        # Собирается контекст для confirm (если был)
         if faq_context:
             single_pass_context.update(faq_context)
             logger.info(f"[LLM] В контекст передана статья FAQ (faq_article): {json.dumps(faq_context, ensure_ascii=False)[:160]}...")
 
-        # Единственный вызов "мозга" — LLM решает сценарий и сама ходит в RAG через tools
+        # Единственный вызов "мозга" — LLM решает сценарий и сам ходит в RAG через tools
         try:
             logger.info("[LLM] Единичный вызов ask_openai запущен")
             ai_response = await ask_openai(
@@ -768,9 +812,8 @@ async def chat(
                 "stage": stage,
                 "action": "smalltalk",
                 "fields": {},
-                "reply": "Техническая заминка. Давайте попробуем ещё раз?"
+                "reply": "Неожиданная ошибка 5. Давайте попробуем ещё раз?"
             }
-
 
         scenario_lock = (ai_response.get("scenario") or "OFFTOPIC").upper()
         action = ai_response.get("action") or (ai_response.get("fields") or {}).get("action")
@@ -779,14 +822,14 @@ async def chat(
         ALLOWED_FIELDS = {
             "FAQ": {"action", "article_id"},
             "ANALYTICS": {"action", "query", "niche", "selection", "list"},
-            "REGISTRATION": {"code", "phone", "email", "niche", "city"},
+            "REGISTRATION": {"code", "niche", "city"},
             "OFFTOPIC": set()
         }
         sanitized_fields = {k: v for k, v in raw_fields.items() if k in ALLOWED_FIELDS.get(scenario_lock, set())}
         if "action" in ai_response and ("action" in ALLOWED_FIELDS.get(scenario_lock, set())):
             sanitized_fields["action"] = ai_response["action"]
 
-        # Только для FAQ разрешаем article_id
+        # Только для FAQ разрешено article_id
         if scenario_lock == "FAQ":
             aid = ai_response.get("article_id") or sanitized_fields.get("article_id")
             if aid is not None:
@@ -794,7 +837,7 @@ async def chat(
                 if aid_str and aid_str.lower() not in ("none", "null", "nan", "0"):
                     ai_response["article_id"] = aid_str
                     sanitized_fields["article_id"] = aid_str
-            # Сохранение последней статьи (TTL=1h) — только когда LLM реально вернула article_id
+            # Сохранение последней статьи (TTL=1h) — только когда LLM реально вернул article_id
             if ai_response.get("article_id"):
                 try:
                     await redis.set(FAQ_LAST_AID_KEY, ai_response["article_id"], ex=3600)  # TTL 1 час
@@ -816,46 +859,94 @@ async def chat(
         except Exception as e:
             logger.warning(f"[STATE] failed to store last_ai_*: {e}")
 
-# STAGE единый верификатор
-        # Работает только для REGISTRATION. Для остальных сценариев stage не меняем и наружу не отдаём.
+        # STAGE единый верификатор
+        # Работает только для REGISTRATION. Для остальных сценариев stage не используется.
         desired_stage = ai_response.get("stage", stage)   # что запросил ассистент
         if scenario_lock == "REGISTRATION":
             emit_stage = True
-            # Авторизованный — сразу финальная стадия
             if user:
-                desired_stage = 4
-            # Разрешён только stay или +1
+                desired_stage = 3
             if not (desired_stage == stage or desired_stage == stage + 1):
                 logger.warning(f"Прыжок stage запрещён в REGISTRATION: {stage} → {desired_stage}")
                 return set_session_cookie(JSONResponse({
                     "reply": "Неожиданная ошибка! Давай попробуем ещё раз.",
                     "meta": {"stage": stage, "reason": "stage_jump"}
                 }), session_id)
-            # Спец-проверка перехода 1→2: валидируем=т код прежде чем менять stage
+
             if (not user) and stage == 1 and desired_stage == 2:
                 user_code = fields.get("code")
                 if not user_code:
                     logger.warning(f"Код не найден в fields, stage=1→2, session={session_id}")
                     return set_session_cookie(JSONResponse({
-                        "reply": "Код не распознан. Введите 6-значный код из Telegram.",
+                        "reply": "Код не верный или устарел. Введите 6-значный код из Telegram.",
                         "meta": {"stage": 1, "reason": "code_missing"}
                     }), session_id)
                 code_key = f"real_code:{user_code}"
                 if not (await redis.exists(code_key)):
                     logger.warning(f"Невалидный код: {user_code}, session={session_id}")
                     return set_session_cookie(JSONResponse({
-                        "reply": "Введённый код неверен или устарел. Запросите новый код в Telegram-боте.",
+                        "reply": "Код не верный или устарел. Запросите новый код в Telegram боте.",
                         "meta": {"stage": 1, "reason": "code_invalid"}
                     }), session_id)
                 await redis.delete(code_key)
                 logger.info(f"Код принят: {user_code}, session={session_id}")
-            # Переход прошёл проверки — фиксируем
-            new_stage = desired_stage
-            await redis.set(stage_key, new_stage, ex=12*60*60)
+                await redis.set(f"reg_code:{session_id}", user_code, ex=3600)
+
+            # 2→3: должны быть city и niche
+            if (not user) and stage == 2 and desired_stage == 3:
+                _city  = fields.get("city")  or (await redis.get(f"reg_city:{session_id}"))
+                _niche = fields.get("niche") or (await redis.get(f"reg_niche:{session_id}"))
+
+                # мягкая проверка: непусто + хотя бы одна буква (лат/кириллица)
+                def _ok(x: str) -> bool:
+                    x = (x or "").strip()
+                    return bool(x) and bool(re.search(r"[a-zA-Zа-яА-Я]", x))
+
+                if not (_ok(_city) and _ok(_niche)):
+                    logger.warning(f"city/niche не прошли мягкую проверку при переходе 2→3, session={session_id}")
+                    return set_session_cookie(JSONResponse({
+                        "reply": "Укажите город и нишу бизнеса, например: 'Москва штукатурка'.",
+                        "meta": {"stage": 2, "reason": "city_niche_missing_or_invalid"}
+                    }), session_id)
+
+            defer_stage_commit = False
+            new_stage = stage
+            
+            if (not user) and stage == 1 and desired_stage == 2:
+                new_stage = 2
+            elif (not user) and stage == 2 and desired_stage == 3:
+                _city  = fields.get("city")  or (await redis.get(f"reg_city:{session_id}"))
+                _niche = fields.get("niche") or (await redis.get(f"reg_niche:{session_id}"))
+            
+                def _ok(x: str) -> bool:
+                    x = (x or "").strip()
+                    return bool(x) and bool(re.search(r"[a-zA-Zа-яА-Я]", x))
+            
+                if not (_ok(_city) and _ok(_niche)):
+                    logger.warning(f"city/niche не прошли мягкую проверку при переходе 2→3, session={session_id}")
+                    return set_session_cookie(JSONResponse({
+                        "reply": "Укажите город и нишу бизнеса, например: 'Москва подъёмная техника'.",
+                        "meta": {"stage": 2, "reason": "city_niche_missing_or_invalid"}
+                    }), session_id)
+
+                new_stage = 3
+                defer_stage_commit = True
+
+            else:
+                if desired_stage in (stage, stage + 1):
+                    new_stage = desired_stage
+                else:
+                    logger.warning(f"Прыжок stage запрещён в REGISTRATION: {stage} → {desired_stage}")
+                    return set_session_cookie(JSONResponse({
+                        "reply": "Неожиданная ошибка! Давай попробуем ещё раз?",
+                        "meta": {"stage": stage, "reason": "stage_jump"}
+                    }), session_id)
+
+            if not defer_stage_commit:
+                await redis.set(stage_key, new_stage, ex=12*60*60)
             stage_out = new_stage
-            logger.info(f"[REG] Stage updated: {stage} → {new_stage} session={session_id}")
+            logger.info(f"[REG] Stage {'deferred ' if defer_stage_commit else ''}update: {stage} → {new_stage} session={session_id}")
         else:
-            # FAQ / ANALYTICS / OFFTOPIC — stage не трогаем и не отдаем
             logger.info(f"[NON-REG] Stage unchanged: {stage} (scenario={scenario_lock})")
 
         # --- Унифицированный выбор коллекции и второй вызов ассистента (FAQ ИЛИ ANALYTICS) ---
@@ -908,7 +999,7 @@ async def chat(
             select(Message)
             .where(Message.session_id == session_id)
             .order_by(Message.created_at.desc())
-            .limit(3) # было .limit(10)
+            .limit(10)
         )
         result = await db.execute(q)
         msgs_keep = result.scalars().all()[::-1]
@@ -920,7 +1011,7 @@ async def chat(
         )
         result_all = await db.execute(q_all)
         all_msgs = result_all.scalars().all()
-        if len(all_msgs) > 3: # было > 10
+        if len(all_msgs) > 10:
             ids_keep = set(msg.id for msg in msgs_keep)
             ids_del = [msg.id for msg in all_msgs if msg.id not in ids_keep]
             if ids_del:
@@ -928,114 +1019,159 @@ async def chat(
                     Message.__table__.delete().where(Message.id.in_(ids_del))
                 )
 
-        # --- B. Сохраняем phone/email в Redis всегда (контекст сохраняется) ---
+        # --- B. Сохраняем город/нишу в Redis всегда ---
         updated = False
-        if fields.get("phone") and fields["phone"] != phone_redis:
-            await redis.set(f"reg_phone:{session_id}", fields["phone"], ex=3600)
-            phone_redis = fields["phone"]
+        if fields.get("city"):
+            await redis.set(f"reg_city:{session_id}", fields["city"], ex=12*60*60)
             updated = True
-        if fields.get("email") and fields["email"] != email_redis:
-            await redis.set(f"reg_email:{session_id}", fields["email"], ex=3600)
-            email_redis = fields["email"]
+        if fields.get("niche"):
+            await redis.set(f"reg_niche:{session_id}", fields["niche"], ex=12*60*60)
             updated = True
 
-        phone_final = fields.get("phone") or phone_redis
-        email_final = fields.get("email") or email_redis
+        reg_city = (await redis.get(f"reg_city:{session_id}")) or fields.get("city")
+        reg_niche = (await redis.get(f"reg_niche:{session_id}")) or fields.get("niche")
 
         if updated:
-            logger.info(f"[PATCH] reg_phone:{session_id}={phone_redis}, reg_email:{session_id}={email_redis}")
+            logger.info(f"[PATCH] reg_city:{session_id}={await redis.get(f'reg_city:{session_id}')}, reg_niche:{session_id}={await redis.get(f'reg_niche:{session_id}')}")
 
-        # --- Регистрируем пользователя ---
-        if (not user) and stage == 3 and new_stage == 4 and phone_final and email_final:
+        # --- Регистрирует пользователя ---
+        if (not user) and stage == 2 and new_stage == 3:
             try:
-                q = select(User).where(
-                    (User.phone == phone_final) | (User.email == email_final)
-                )
+                _city = reg_city or (await redis.get(f"reg_city:{session_id}"))
+                _niche = reg_niche or (await redis.get(f"reg_niche:{session_id}"))
+                if not (_city and _niche):
+                    logger.warning(f"[REGISTER] Нет city/niche при финале 2→3")
+                    return set_session_cookie(JSONResponse({
+                        "reply": "Не хватает города/ниши бизнеса. Попробуейте ещё раз",
+                        "meta": {"stage": 2, "reason": "city_niche_missing"}
+                    }), session_id)
+
+                # 1. Генерирует логин/пароль
+                login_username = generate_login_from_city_niche(_city, _niche)
+                password = generate_password(8)
+                password_hash = password_helper.hash(password)
+
+                # 2. Проверка коллизий + сервисный email
+                synthetic_email = f"autogen+{login_username}@leadinc.local"
+                q = select(User).where((User.login == login_username) | (User.email == synthetic_email))
                 result = await db.execute(q)
                 existing = result.scalar_one_or_none()
                 if existing:
-                    logger.info(f"Регистрация отклонена: телефон/почта заняты, session={session_id}")
+                    logger.info(f"Регистрация отклонена: login/email заняты, session={session_id}")
                     return set_session_cookie(JSONResponse({
-                        "reply": "Этот телефон или почта уже зарегистрированы.",
-                        "meta": {"stage": 3}
+                        "reply": "Ошибка, попробуйте ещё раз.",
+                        "meta": {"stage": 2}
                     }), session_id)
-                # 2. Генерируем пароль, хешируем
-                password = generate_password(8)
-                password_hash = password_helper.hash(password)
+
+                # 3. Создаёт пользователя
                 user_obj = User(
-                    email=email_final,
-                    phone=phone_final,
+                    email=synthetic_email,
+                    login=login_username,
+                    phone=None,
                     hashed_password=password_hash,
                     is_active=True,
                     is_verified=True,
                 )
                 db.add(user_obj)
-                await db.flush()   
+                await db.flush()
 
-                # 3. Привязываем сессию к user_id
                 q = select(SessionModel).where(SessionModel.id == session_id)
                 res = await db.execute(q)
                 session_db = res.scalar_one_or_none()
                 if session_db and not session_db.user_id:
                     session_db.user_id = user_obj.id
 
-                # 4. Генерируем JWT
+                # 4. JWT и промокод
                 jwt_strategy = get_jwt_strategy()
-                
-                # 5. Генерируем уникальный промокод с порядковым номером (по IP)
-                guest_ip = request.client.host  # получаем IP гостя
+                guest_ip = request.client.host
                 promo_counter_key = f"promo_counter:{guest_ip}"
                 promo_number = await redis.incr(promo_counter_key)
-                promo_code = f"LEAD{promo_number:03d}"  # LEAD001, LEAD002 и т.д.
-                
-                # 6. Логируем выдачу промокода
+                promo_code = f"LEAD{promo_number:03d}"
+
                 promo_log_key = f"promo_issued:{guest_ip}:{promo_number:03d}"
-                promo_log_value = f"{email_final}|{phone_final}|{int(time.time())}"
+                promo_log_value = f"{synthetic_email}|{int(time.time())}"
                 await redis.set(promo_log_key, promo_log_value)
 
-                # 7. Формируем финальный текст для пользователя с промокодом
                 promo_text = (
-                    f"\n\n 🎁 Ваш промокод на 10 бесплатных телефонных номеров: {promo_code}\n"
+                    f"\n\n 🎁 Вам предоставлен бонус на 10 бесплатных телефонных номеров: {promo_code}\n"
                     f"Порядковый номер регистрации: {promo_number:03d}"
                 )
                 token = await jwt_strategy.write_token(user_obj)
 
-                # 8. dev info
-                dev_block = (
-                    "\n\n------------------------\n"
-                    "[альфа тест]\n"
-                    "Вы автоматически авторизованы и зарегистрированы! Теперь вам доступен расширенный функционал Leadinc.\n"
-                    f"Ваши данные для входа:\n"
-                    f"Телефон: {phone_final}\n"
-                    f"Email: {email_final}\n"
-                    f"Пароль: {password}\n"
-                    "------------------------"
-                )
-                ai_response["reply"] = (ai_response.get("reply") or "") + promo_text + dev_block
-                logger.info(f"Новый пользователь зарегистрирован: email={email_final}, phone={phone_final}, promo={promo_code}, ip={guest_ip}, номер={promo_number:03d}")
-                logger.info(f"Final AI reply: {ai_response['reply']}")
-                
-                # Очищаем временные ключи (и autoочистка на 5 дней)
+                # ⚠️ WARNING! DEV MODE — отключить функцию при переходе на HTTPS!
+                postreg_context = {
+                    "flags": {
+                        "postreg_offer_analytics": True,
+                        "dev_show_credentials": True,        # отключить в PROD
+                        "dev_warning_https": True
+                    },
+                    "dev_credentials": {
+                        "login": login_username,
+                        "password": password,
+                        "promo_code": promo_code,
+                        "promo_number": f"{promo_number:03d}"
+                    },
+                    "reg_city": _city,
+                    "reg_niche": _niche
+                }
+
+                try:
+                    ai_response_post = await ask_openai(
+                        content="registration_complete",
+                        msg_type="text",
+                        answer_format="text",
+                        stage=3,
+                        user_authenticated=True,
+                        phone=None,
+                        email=synthetic_email,
+                        context=postreg_context,
+                        messages=messages_for_gpt
+                    )
+                    final_reply = (ai_response_post.get("reply") or "") + promo_text
+                except Exception as e:
+                    logger.error(f"[LLM POST-REG] Ошибка формирования сообщения с кредами: {e}")
+                    final_reply = (ai_response.get("reply") or "") + promo_text + \
+                        "\n\n(Уведомление: ваши аккаунт создан.)"
+
+                # Сохраняtn финальный ассистентский ответ в БД
+                try:
+                    assistant_msg2 = Message(
+                        session_id=session_id,
+                        user_id=user_obj.id,
+                        role="assistant",
+                        type="text",
+                        status="ok",
+                        content=final_reply,
+                        meta={}
+                    )
+                    db.add(assistant_msg2)
+                except Exception as e:
+                    logger.error(f"DB error while saving assistant post-reg message: {str(e)}")
+
+                logger.info(f"[REGISTER NEW] login={login_username}, niche={_niche}, city={_city}, promo={promo_code}, ip={guest_ip}, номер={promo_number:03d}")
+
+                # Очистка и флаги — как было
                 await redis.delete(f"stage:{session_id}")
                 await redis.delete(f"reg_phone:{session_id}")
-                await redis.delete(f"reg_email:{session_id}")
+                await redis.delete(f"reg_email:{session_id}") 
                 await redis.delete(f"reg_attempts:{session_id}")
                 await redis.delete(f"msg_count:{session_id}:stage1")
                 await redis.delete(f"msg_count:{session_id}:stage2")
                 await redis.delete(f"msg_count:{session_id}:stage3")
                 await redis.delete(f"guest_flood:{session_id}")
+                await redis.set(f"postreg_offer_analytics:{session_id}", 1, ex=3600)
+                await redis.set(f"reg_niche:{session_id}", _niche, ex=3600)
+                await redis.set(f"reg_city:{session_id}", _city, ex=3600)
                 await redis.expire(session_id, five_days())
 
-                # Отправляем финальный ответ и куки
+                # Собираем response_data БЕЗ login/password в meta и возвращаем ответ ЗДЕСЬ
                 response_data = {
-                    "reply": ai_response["reply"],
+                    "reply": final_reply,
                     "meta": {
                         "stage": new_stage,
-                        "usage": ai_response.get("usage", {}),
+                        "usage": (ai_response_post or {}).get("usage", {}),
                         "fields": fields,
-                        "token": token,
-                        "login": email_final,    # или phone_final
-                        "password": password     # ТОЛЬКО ДЛЯ DEV!
+                        "token": token
                     }
                 }
                 response = JSONResponse(response_data)
@@ -1047,7 +1183,6 @@ async def chat(
                     secure=not DEBUG,
                     samesite="Strict" if not DEBUG else "Lax"
                 )
-                # Кука с JWT-токеном (имя куки = как в fastapi_users.config, обычно "fastapiusersauth")
                 response.set_cookie(
                     key="fastapiusersauth",
                     value=token,
@@ -1063,8 +1198,58 @@ async def chat(
                 await db.rollback()
                 return set_session_cookie(JSONResponse({
                     "reply": "Техническая ошибка регистрации. Попробуйте снова.",
-                    "meta": {"stage": 3, "reason": "register_error"}
+                    "meta": {"stage": 2, "reason": "register_error"}
                 }), session_id)
+
+#                dev_block = (
+#                    "\n\n------------------------\n"
+#                    "[альфа тест]\n"
+#                    "Вы автоматически авторизованы и зарегистрированы!\n"
+#                    f"Ваши данные для входа:\n"
+#                    f"Логин: {login_username}\n"
+#                    f"Пароль: {password}\n"
+#                    "------------------------"
+#                )
+#                ai_response["reply"] = (ai_response.get("reply") or "") + promo_text + dev_block
+#                logger.info(f"[REGISTER NEW] login={login_username}, niche={_niche}, city={_city}, promo={promo_code}, ip={guest_ip}, номер={promo_number:03d}")
+
+#                response_data = {
+#                    "reply": ai_response["reply"],
+#                    "meta": {
+#                        "stage": new_stage,
+#                        "usage": ai_response.get("usage", {}),
+#                        "fields": fields,
+#                        "token": token,
+#                        "login": login_username,
+#                        "password": password  # DEV ONLY
+#                    }
+#                }
+#                response = JSONResponse(response_data)
+#                response.set_cookie(
+#                    key=SESSION_COOKIE_NAME,
+#                    value=session_id,
+#                    max_age=12 * 60 * 60,
+#                    httponly=True,
+#                    secure=not DEBUG,
+#                    samesite="Strict" if not DEBUG else "Lax"
+#                )
+#                response.set_cookie(
+#                    key="fastapiusersauth",
+#                    value=token,
+#                    max_age=12 * 60 * 60,
+#                    httponly=True,
+#                    secure=not DEBUG,
+#                    samesite="Strict" if not DEBUG else "Lax"
+#                )
+#                await db.commit()
+#                return response
+#            except Exception as e:
+#                logger.error(f"Ошибка при регистрации: {str(e)}")
+#                await db.rollback()
+#                return set_session_cookie(JSONResponse({
+#                    "reply": "Техническая ошибка регистрации. Попробуйте снова.",
+#                    "meta": {"stage": 2, "reason": "register_error"}
+#                }), session_id)
 
         # --- Сбор финального ответа и поддержка voice-ответа ---
         # НОРМАЛИЗАЦИЯ reply ДЛЯ ВЫДАЧИ/ОЗВУЧКИ ===
@@ -1086,13 +1271,13 @@ async def chat(
             "usage": ai_response.get("usage", {}),
             "fields": fields,
         }
-        if emit_stage:  # только для REGISTRATION
+        if emit_stage:
             meta_base["stage"] = stage_out
 
         if answer_format == "voice":
             _preview = (reply or "")
             if not isinstance(_preview, str) or not _preview.strip():
-                # Нет текста для озвучки — честный фолбэк в текст
+                # Нет текста для озвучки — делает фолбэк в текст
                 logger.warning("[TTS] Пропуск озвучки: пустой/невалидный текст → текстовый ответ")
                 response_payload = {
                     "reply_type": "text",
@@ -1101,7 +1286,7 @@ async def chat(
                 }
             else:
                 logger.info(f"[TTS] Генерация аудио-ответа. Превью текста: {reply[:60]!r}")
-                # Генерируем voice через TTS (Celery)
+                # Генерирует voice через TTS (Celery)
                 tts_format = payload.get("tts_format", "mp3")
                 if tts_format not in SUPPORTED_TTS_FORMATS:
                     logger.warning(f"[VOICE] Некорректный tts_format '{tts_format}', принудительно mp3")
@@ -1174,14 +1359,24 @@ async def chat(
             reply_text = response_payload.get("reply") if isinstance(response_payload, dict) else ""
             is_error_reply = isinstance(reply_text, str) and reply_text.startswith("Случайная ошибка")
             effective_action = action or (fields.get("action") if isinstance(fields, dict) else "")
+
             if confirm_used and scenario_lock == "FAQ" and effective_action == "full_article" and not is_error_reply:
                 await redis.delete(FAQ_LAST_AID_KEY)
                 logger.info("[FAQ][CONFIRM] last_article_id очищен после успешной выдачи full_article")
+            if scenario_lock == "ANALYTICS" and effective_action == "analytics" and not is_error_reply:
+                table = None
+                try:
+                    dash = response_payload.get("dashboard") if isinstance(response_payload, dict) else None
+                    table = (dash or {}).get("table") if isinstance(dash, dict) else None
+                except Exception:
+                    table = None
+                if isinstance(table, list) and len(table) > 0:
+                    await redis.delete(f"postreg_offer_analytics:{session_id}")
+                    logger.info("[AN] postreg_offer_analytics очищен (успешная таблица)")
+        
         except Exception as e:
             logger.warning(f"[FAQ][CONFIRM] Ошибка отложенного удаления last_article_id: {e}")
-
         return set_session_cookie(JSONResponse(response_payload), session_id)
-
 
 @ai_router.post("/voice_upload")
 async def voice_upload(
@@ -1189,13 +1384,12 @@ async def voice_upload(
     session_id: str = Form(...),
     user: User = Depends(current_active_user_optional)
 ):
-    # 1. Сохраняем файл на диск асинхронно
+    # 1. Сохраняет файл на диск асинхронно
     audio_path = await save_upload_file(file)
     user_id = str(user.id) if user else None
 
-    # 2. Кидаем задачу в Celery (важно — sync вызов в async-функции!)
+    # 2. Создает задачу в Celery (важно — sync вызов в async-функции!)
     task = stt_task.apply_async(args=[audio_path, user_id, session_id])
-
     return {"task_id": task.id, "status": "pending"}
 
 @ai_router.post("/tts")
@@ -1237,8 +1431,8 @@ async def logout(request: Request, response: Response):
     session_id = request.cookies.get("sessionid")
     if session_id:
         await redis.delete(f"stage:{session_id}")
-        await redis.delete(f"reg_phone:{session_id}")
-        await redis.delete(f"reg_email:{session_id}")
+        await redis.delete(f"reg_city:{session_id}")
+        await redis.delete(f"reg_niche:{session_id}")
         await redis.delete(f"reg_attempts:{session_id}")
         await redis.delete(f"msg_count:{session_id}:stage1")
         await redis.delete(f"msg_count:{session_id}:stage2")
@@ -1266,7 +1460,6 @@ async def logout(request: Request, response: Response):
         path="/",
     )
     return resp
-
 
 # --- Поддержка/почта ---
 @ai_router.post("/support")
